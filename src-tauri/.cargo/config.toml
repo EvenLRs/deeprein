@@ -1,0 +1,4 @@
+# 仅对 x86_64-pc-windows-gnu（MinGW）构建生效；MSVC 构建不受影响。
+# 适用于使用 w64devkit / winlibs 等不带目标前缀 gcc 的 MinGW 环境。
+[target.x86_64-pc-windows-gnu]
+linker = "gcc"

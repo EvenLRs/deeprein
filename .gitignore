@@ -1,0 +1,15 @@
+# Node
+node_modules/
+
+# Rust
+src-tauri/target/
+
+# Tauri 构建生成物
+src-tauri/gen/schemas/
+
+# 系统/编辑器
+Thumbs.db
+.DS_Store
+*.log
+.idea/
+.vscode/

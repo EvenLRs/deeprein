@@ -1,0 +1,9 @@
+{
+  "harness_url": "http://127.0.0.1:3080",
+  "backend_command": null,
+  "backend_cwd": null,
+  "auto_start_backend": true,
+  "start_timeout_sec": 90,
+  "start_check_interval_ms": 1500,
+  "backend_log_file": "backend.log"
+}

@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DeepSeek Harness 桌面客户端</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+      background: radial-gradient(1100px 560px at 50% -12%, #1c2e52 0%, #101a2e 52%, #0a0f1c 100%);
+      color: #e7eefb;
+      user-select: none;
+    }
+    .card {
+      width: 480px;
+      max-width: calc(100vw - 48px);
+      padding: 44px 40px 36px;
+      text-align: center;
+      background: rgba(255, 255, 255, 0.045);
+      border: 1px solid rgba(255, 255, 255, 0.09);
+      border-radius: 20px;
+      box-shadow: 0 24px 70px rgba(0, 0, 0, 0.45);
+    }
+    .logo {
+      width: 72px;
+      height: 72px;
+      margin: 0 auto 18px;
+      border-radius: 18px;
+      background: linear-gradient(135deg, #4d8dff, #10b981);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 800;
+      font-size: 26px;
+      letter-spacing: 1px;
+      color: #fff;
+      box-shadow: 0 10px 28px rgba(77, 141, 255, 0.35);
+    }
+    h1 { margin: 0; font-size: 24px; font-weight: 700; }
+    .sub { margin: 6px 0 24px; font-size: 13px; color: #9fb0cc; letter-spacing: 2px; }
+    .status, .error { min-height: 64px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; }
+    .status .row { display: flex; align-items: center; gap: 10px; font-size: 14px; color: #c7d4ec; }
+    .status .cmd { font-size: 11.5px; color: #8fa1c0; max-width: 380px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .spinner {
+      width: 18px; height: 18px;
+      border: 2.5px solid rgba(255, 255, 255, 0.2);
+      border-top-color: #4d8dff;
+      border-radius: 50%;
+      animation: spin 0.9s linear infinite;
+      flex: none;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .status.ok .spinner { border-color: rgba(16, 185, 129, 0.35); border-top-color: #10b981; }
+    .error .icon { font-size: 26px; }
+    .error p { margin: 2px 0; font-size: 13.5px; }
+    .error .hint { font-size: 12px; color: #8fa1c0; line-height: 1.6; }
+    .error .hint code { color: #b8c9e8; }
+    .error pre {
+      margin: 8px 0 0; padding: 8px 12px; width: 100%; max-height: 130px; overflow: auto;
+      text-align: left; font-size: 11px; line-height: 1.5; white-space: pre-wrap; word-break: break-all;
+      background: rgba(0, 0, 0, 0.35); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 8px;
+      color: #b8c9e8;
+    }
+    .actions { margin-top: 26px; display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+    button {
+      appearance: none;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      background: rgba(255, 255, 255, 0.07);
+      color: #e7eefb;
+      padding: 9px 20px;
+      border-radius: 10px;
+      font-size: 13.5px;
+      cursor: pointer;
+      transition: background 0.15s, transform 0.05s;
+    }
+    button:hover { background: rgba(255, 255, 255, 0.13); }
+    button:active { transform: scale(0.97); }
+    button.primary {
+      background: linear-gradient(135deg, #4d8dff, #3b6fd6);
+      border-color: transparent;
+      font-weight: 600;
+    }
+    button.primary:hover { filter: brightness(1.08); background: linear-gradient(135deg, #4d8dff, #3b6fd6); }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">DSH</div>
+    <h1>DeepSeek Harness</h1>
+    <p class="sub">WINDOWS 桌面客户端</p>
+
+    <div id="status" class="status">
+      <div class="row">
+        <div class="spinner"></div>
+        <span id="status-text">正在检测 Harness 服务…</span>
+      </div>
+      <div id="status-cmd" class="cmd hidden"></div>
+    </div>
+
+    <div id="error" class="error hidden">
+      <div class="icon">⚠️</div>
+      <p id="error-text">未检测到 DeepSeek Harness 服务。</p>
+      <p class="hint" id="error-hint"></p>
+      <pre id="logtail" class="hidden"></pre>
+    </div>
+
+    <div class="actions">
+      <button id="retry" class="primary hidden">重试</button>
+      <button id="start" class="hidden">启动后端</button>
+      <button id="open" class="hidden">仍然打开</button>
+      <button id="quit">退出</button>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const tauri = () => window.__TAURI_INTERNALS__;
+
+    // 调试埋点：写入 exe 旁 launcher.log
+    async function log(msg) {
+      try {
+        if (window.__TAURI_INTERNALS__) {
+          await window.__TAURI_INTERNALS__.invoke('debug_log', { text: msg });
+        }
+      } catch (e) { /* 忽略 */ }
+    }
+
+    const DEFAULTS = {
+      harness_url: 'http://127.0.0.1:3080',
+      auto_start_backend: true,
+      start_timeout_sec: 90,
+      start_check_interval_ms: 1500,
+      backend_command: null,
+    };
+
+    let cfg = { ...DEFAULTS };
+    let HARNESS = cfg.harness_url;
+
+    let opened = false;
+    let timer = null;
+    let stopped = false;
+    let startedBackend = false;
+    let startingBackend = false;
+    let startDeadline = 0;
+
+    function setStatus(text, ok, cmdText) {
+      $('status').classList.remove('hidden');
+      $('status').classList.toggle('ok', !!ok);
+      $('status-text').textContent = text;
+      if (cmdText) {
+        $('status-cmd').textContent = cmdText;
+        $('status-cmd').classList.remove('hidden');
+      } else {
+        $('status-cmd').classList.add('hidden');
+      }
+      $('error').classList.add('hidden');
+    }
+
+    function fail(text, hintText) {
+      stopped = true;
+      if (timer) { clearInterval(timer); timer = null; }
+      $('status').classList.add('hidden');
+      $('error-text').textContent = text;
+      $('error-hint').textContent = hintText || '';
+      $('error').classList.remove('hidden');
+      $('retry').classList.remove('hidden');
+      $('start').classList.remove('hidden');
+      $('open').classList.remove('hidden');
+    }
+
+    // 探测 Harness 是否可达（no-cors 不受 CORS 限制，只判断通/不通）
+    async function isReachable() {
+      try {
+        await fetch(HARNESS, { mode: 'no-cors', cache: 'no-store' });
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    async function open() {
+      if (opened) return;
+      opened = true;
+      setStatus('检测成功，正在打开 Harness…', true);
+      await log('open(): HARNESS=' + HARNESS + ', tauri=' + (typeof window.__TAURI_INTERNALS__));
+      try {
+        if (tauri()) {
+          await tauri().invoke('open_harness');
+          await log('open(): open_harness invoked OK');
+        } else {
+          await log('open(): 无 Tauri 全局，走 location.href 兜底');
+          window.location.href = HARNESS; // 普通浏览器预览时的兜底
+        }
+      } catch (e) {
+        await log('open(): 失败 ' + (e && e.message ? e.message : e));
+        opened = false;
+        fail('打开 Harness 失败：' + (e && e.message ? e.message : e));
+      }
+    }
+
+    async function doStart() {
+      if (startingBackend) return; // 防止重叠轮询重复启动
+      startingBackend = true;
+      try {
+        const r = await tauri().invoke('start_backend');
+        await log('doStart(): start_backend OK: ' + JSON.stringify(r));
+        startedBackend = true;
+        startDeadline = Date.now() + cfg.start_timeout_sec * 1000;
+        setStatus('已发出启动命令，等待服务就绪…', false, r && r.command ? '命令：' + r.command : '');
+      } catch (e) {
+        await log('doStart(): start_backend 失败 ' + (e && e.message ? e.message : e));
+        startingBackend = false; // 允许重试
+        startedBackend = false;
+        fail('启动后端失败：' + (e && e.message ? e.message : e), '请检查 exe 旁的 config.json 中的 backendCommand 配置。');
+      }
+    }
+
+    async function showLogTail() {
+      try {
+        const tail = await tauri().invoke('read_backend_log', { lines: 30 });
+        if (tail && tail !== '(日志尚未生成)') {
+          $('logtail').textContent = tail;
+          $('logtail').classList.remove('hidden');
+        }
+      } catch { /* 忽略 */ }
+    }
+
+    async function tick() {
+      if (opened || stopped) return;
+      const ok = await isReachable();
+      if (opened || stopped) return;
+      if (ok) { await open(); return; }
+
+      if (!startedBackend) {
+        if (cfg.auto_start_backend) {
+          await log('tick(): ' + HARNESS + ' 不可达，触发自动启动');
+          setStatus('未检测到后端，正在自动启动…');
+          await doStart();
+        } else {
+          await log('tick(): ' + HARNESS + ' 不可达且 auto_start=false');
+          fail('未检测到 DeepSeek Harness 服务。', '可点击「启动后端」或手动在终端运行 dsh web。');
+        }
+        return;
+      }
+
+      // 已发出启动命令：等待就绪，超时则失败
+      if (Date.now() > startDeadline) {
+        await log('tick(): 启动超时');
+        const tail = await readTailSafe();
+        fail(
+          '后端启动超时（' + cfg.start_timeout_sec + ' 秒内未就绪）。',
+          '可点击「重试」再次检测，或查看下方后端日志。'
+        );
+        if (tail) { $('logtail').textContent = tail; $('logtail').classList.remove('hidden'); }
+        return;
+      }
+      setStatus('后端已启动，等待服务就绪…');
+    }
+
+    async function readTailSafe() {
+      try {
+        const tail = await tauri().invoke('read_backend_log', { lines: 30 });
+        return tail && tail !== '(日志尚未生成)' ? tail : null;
+      } catch { return null; }
+    }
+
+    $('retry').onclick = () => {
+      stopped = false;
+      startedBackend = false;
+      $('retry').classList.add('hidden');
+      $('start').classList.add('hidden');
+      $('open').classList.add('hidden');
+      $('logtail').classList.add('hidden');
+      setStatus('正在重新检测…');
+      timer = setInterval(tick, cfg.start_check_interval_ms);
+      tick();
+    };
+    $('start').onclick = async () => {
+      $('start').classList.add('hidden');
+      $('retry').classList.add('hidden');
+      setStatus('正在启动后端…');
+      await doStart();
+      timer = setInterval(tick, cfg.start_check_interval_ms);
+    };
+    $('open').onclick = () => open(); // 强制打开（服务响应慢或探测被拦截时）
+    $('quit').onclick = () => {
+      if (tauri()) tauri().invoke('quit_app');
+      else window.close();
+    };
+
+    (async function init() {
+      await log('init(): 页面加载，__TAURI_INTERNALS__=' + (typeof window.__TAURI_INTERNALS__));
+      try {
+        if (tauri()) {
+          const c = await tauri().invoke('get_config');
+          await log('init(): get_config OK: ' + JSON.stringify(c));
+          if (c) cfg = Object.assign({}, DEFAULTS, c);
+        } else {
+          await log('init(): 无 Tauri 全局，使用默认配置');
+        }
+      } catch (e) {
+        await log('init(): get_config 失败: ' + (e && e.message ? e.message : e));
+      }
+      HARNESS = cfg.harness_url;
+      await log('init(): HARNESS=' + HARNESS + ' auto_start=' + cfg.auto_start_backend + ' interval=' + cfg.start_check_interval_ms);
+      timer = setInterval(tick, cfg.start_check_interval_ms);
+      tick();
+    })();
+  </script>
+</body>
+</html>
