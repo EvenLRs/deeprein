@@ -10,7 +10,6 @@
 - 🔌 **连接检测 + 自动启动后端**：启动时自动探测 Harness（默认 `127.0.0.1:3080`）；未运行时自动拉起 `dsh web` 后端并等待就绪，失败时给出友好提示与重试。
 - 🎨 **深色启动页**：原生 UI 质感，检测成功后自动导航进入 Harness。
 - ⚙️ **可配置**：应用旁的 `config.json` 可改地址、启动命令、超时等。
-- 📦 **CI 自动打包**：GitHub Actions 双平台矩阵自动构建安装包（NSIS exe / DMG），打 `v*` 标签即自动发布 Release。
 
 ## 自动启动后端
 
@@ -147,24 +146,9 @@ cargo build --release
 > 窗口内按 `F5` / `Ctrl+R` 可刷新；Harness 端口变更时，修改
 > `src-tauri/src/lib.rs` 与 `dist/index.html` 中的 `HARNESS_URL` 后重新编译。
 
-## 工作原理
-
-1. `WebviewWindowBuilder` 创建主窗口，先加载本地启动页 `dist/index.html`（走 Tauri 自定义协议）。
-2. 启动页通过 `get_config` 读取配置，每 `start_check_interval_ms` 用 `fetch(..., {mode:'no-cors'})` 探测 Harness 是否可达。
-3. 可达 → 调用 `open_harness`（`WebviewWindow::navigate`）进入完整 GUI。
-4. 不可达且 `auto_start_backend` → 调用 `start_backend` 分离启动后端（`node <dsh>/lib/bin.js web`），持续轮询直到就绪（超时 `start_timeout_sec`）或失败；失败页显示 `backend.log` 尾部。
-5. 启动页「退出」按钮调用 `quit_app` 命令退出应用（已启动的后端进程保持运行）。
-
 ## 常见问题
 
 - **提示“未检测到 DeepSeek Harness 服务”**：客户端会先尝试自动启动后端（`dsh web`）；若失败，确认 `config.json` 的 `backend_command` 与 `harness_url` 是否正确，或手动在终端运行 `dsh web`。
 - **应用直接打开了 Harness 页面、启动页（连接检测）不生效**：说明构建时未启用 `tauri/custom-protocol` feature——没有它 release 会按 dev 模式运行，webview 直接加载 `devUrl`。`src-tauri/Cargo.toml` 已正确配置 `features = ["custom-protocol"]`，请勿移除。
 - **编译报错找不到 `link.exe`**：未安装 MSVC 构建工具，安装 Visual Studio Build Tools 的 C++ 工作负载。
 - **第一次编译很慢**：Tauri 依赖较多，首次需拉取并编译数百个 crate，属正常现象。
-
-## 后续可扩展方向
-
-- 系统托盘常驻 + 最小化到托盘（`tauri-plugin-single-instance`、tray API）
-- 单实例锁（避免重复启动多个窗口）
-- 自定义标题栏 / 深色标题栏（`decorations: false` + 前端实现）
-- 断线自动重连与状态提示
