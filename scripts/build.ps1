@@ -40,6 +40,9 @@ try {
             Push-Location $root
             try { npm install } finally { Pop-Location }
         }
+        Write-Host "==> 打包内置后端（backend/）"
+        Push-Location $root
+        try { node scripts/bundle-backend.mjs } finally { Pop-Location }
         Write-Host "==> npm run tauri build"
         Push-Location $root
         try { npm run build } finally { Pop-Location }

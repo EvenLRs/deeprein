@@ -48,6 +48,8 @@ impl Default for ClientConfig {
 
 struct AppState {
     config: Mutex<ClientConfig>,
+    /// Tauri 资源目录（打包时 bundle.resources 的落点，macOS 为 .app/Contents/Resources）
+    resource_dir: PathBuf,
 }
 
 #[derive(Serialize)]
@@ -104,16 +106,25 @@ fn find_node() -> Option<String> {
     Some("node".to_string())
 }
 
-/// 在 npx 缓存里找 @deepseek-ai/dsh 的 CLI 入口（本机实际安装位置）
+/// 在 npx 缓存与 npm 全局目录里找 @deepseek-ai/dsh 的 CLI 入口（本机已安装的 Harness）
 fn find_dsh_bin() -> Option<String> {
     let mut roots: Vec<PathBuf> = Vec::new();
     #[cfg(windows)]
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        roots.push(PathBuf::from(local).join("npm-cache").join("_npx"));
+    {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            roots.push(PathBuf::from(local).join("npm-cache").join("_npx"));
+        }
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            // npm install -g 的全局安装目录
+            roots.push(PathBuf::from(appdata).join("npm").join("node_modules"));
+        }
     }
     #[cfg(not(windows))]
-    if let Ok(home) = std::env::var("HOME") {
-        roots.push(PathBuf::from(home).join(".npm").join("_npx"));
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            roots.push(PathBuf::from(home).join(".npm").join("_npx"));
+        }
+        roots.push(PathBuf::from("/usr/local/lib/node_modules"));
     }
     let mut best: Option<(SystemTime, PathBuf)> = None;
     for root in roots {
@@ -141,20 +152,76 @@ fn find_dsh_bin() -> Option<String> {
     best.map(|(_, p)| p.to_string_lossy().into_owned())
 }
 
-/// 解析最终的后端启动命令
-fn resolve_backend_command(cfg: &ClientConfig) -> Vec<String> {
+/// Windows 的 resource_dir 会带 `\\?\` 长路径前缀，node 等子进程无法解析，需剥掉
+fn normalize_path(s: &str) -> String {
+    #[cfg(windows)]
+    {
+        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            return stripped.to_string();
+        }
+    }
+    s.to_string()
+}
+
+/// 随应用打包的官方 Harness 后端（backend/node + backend/dsh）
+fn bundled_backend(resource_dir: &Path, harness_url: &str) -> Option<Vec<String>> {
+    #[cfg(windows)]
+    let node = resource_dir
+        .join("backend")
+        .join("node")
+        .join("node.exe");
+    #[cfg(not(windows))]
+    let node = resource_dir
+        .join("backend")
+        .join("node")
+        .join("bin")
+        .join("node");
+    let bin = resource_dir
+        .join("backend")
+        .join("dsh")
+        .join("node_modules")
+        .join("@deepseek-ai")
+        .join("dsh")
+        .join("lib")
+        .join("bin.js");
+    if node.exists() && bin.exists() {
+        let mut cmd = vec![
+            normalize_path(&node.to_string_lossy()),
+            normalize_path(&bin.to_string_lossy()),
+            "web".into(),
+        ];
+        // 让内置后端服务与 harness_url 相同的端口
+        if let Ok(url) = harness_url.parse::<tauri::Url>() {
+            if let Some(port) = url.port() {
+                cmd.push("--port".into());
+                cmd.push(port.to_string());
+            }
+        }
+        Some(cmd)
+    } else {
+        None
+    }
+}
+
+/// 解析最终的后端启动命令：
+/// 配置覆盖 → 本机已安装的 Harness（优先）→ 内置（随应用打包）→ PATH/npx 兜底
+fn resolve_backend_command(cfg: &ClientConfig, resource_dir: &Path) -> Vec<String> {
     if let Some(cmd) = &cfg.backend_command {
         if !cmd.is_empty() {
             return cmd.clone();
         }
     }
-    // 1) 本机 npx 缓存里的 dsh CLI：node <bin.js> web
+    // 1) 本机已安装的 Harness（优先使用本地安装）
     if let Some(node) = find_node() {
         if let Some(bin) = find_dsh_bin() {
             return vec![node, bin, "web".into()];
         }
     }
-    // 2) 兜底：PATH 上的 dsh，或 npx 现场拉取
+    // 2) 内置（随应用打包）的官方 Harness
+    if let Some(cmd) = bundled_backend(resource_dir, &cfg.harness_url) {
+        return cmd;
+    }
+    // 3) 兜底：PATH 上的 dsh，或 npx 现场拉取
     #[cfg(windows)]
     let fallback = vec![
         "cmd".into(),
@@ -187,7 +254,8 @@ fn get_config(state: State<'_, AppState>) -> ConfigView {
 #[tauri::command]
 fn start_backend(state: State<'_, AppState>) -> Result<BackendStartResult, String> {
     let cfg = state.config.lock().unwrap().clone();
-    let cmdline = resolve_backend_command(&cfg);
+    let resource_dir = state.resource_dir.clone();
+    let cmdline = resolve_backend_command(&cfg, &resource_dir);
     if cmdline.is_empty() {
         return Err("未配置后端启动命令".into());
     }
@@ -296,8 +364,13 @@ fn quit_app(app: AppHandle) {
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
+            let resource_dir = app
+                .path()
+                .resource_dir()
+                .unwrap_or_else(|_| exe_dir());
             app.manage(AppState {
                 config: Mutex::new(load_config()),
+                resource_dir,
             });
             let win = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                 .title("deeprein")

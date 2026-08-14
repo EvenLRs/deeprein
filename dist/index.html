@@ -219,7 +219,7 @@
         await log('doStart(): start_backend 失败 ' + (e && e.message ? e.message : e));
         startingBackend = false; // 允许重试
         startedBackend = false;
-        fail('启动后端失败：' + (e && e.message ? e.message : e), '请检查 exe 旁的 config.json 中的 backendCommand 配置。');
+        fail('启动后端失败：' + (e && e.message ? e.message : e), '请检查 config.json 的 backendCommand 配置，或确认内置后端（backend/ 目录）完整。');
       }
     }
 

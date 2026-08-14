@@ -8,19 +8,23 @@
 
 - 🪟 **原生窗口**：Windows 用 WebView2、macOS 用 WKWebView（系统内核），无捆绑浏览器，安装包小、内存占用低。
 - 🔌 **连接检测 + 自动启动后端**：启动时自动探测 Harness（默认 `127.0.0.1:3080`）；未运行时自动拉起 `dsh web` 后端并等待就绪，失败时给出友好提示与重试。
+- 📦 **内置官方 Harness 后端**：应用自带 Node 运行时 + 官方 `@deepseek-ai/dsh` 包——本机已安装则优先用本机，未安装则自动启动内置后端，开箱即用。
 - 🎨 **深色启动页**：原生 UI 质感，检测成功后自动导航进入 Harness。
 - ⚙️ **可配置**：应用旁的 `config.json` 可改地址、启动命令、超时等。
 
 ## 自动启动后端
 
-应用检测不到 Harness 时，会自动执行后端启动命令并轮询等待服务就绪，然后进入 GUI：
+应用检测不到 Harness 时，会自动执行后端启动命令并轮询等待服务就绪，然后进入 GUI。
 
-1. 默认命令解析顺序：
-   1. `config.json` 里的 `backend_command`（显式覆盖）
-   2. 本机 npx 缓存里的 dsh CLI：`node <缓存>/@deepseek-ai/dsh/lib/bin.js web`（Windows: `%LOCALAPPDATA%\npm-cache\_npx`；macOS: `~/.npm/_npx`）
-   3. 兜底：Windows `cmd /C "dsh web || npx -y @deepseek-ai/dsh web"`，macOS/Linux `sh -c "dsh web || npx -y @deepseek-ai/dsh web"`
-2. 后端进程**分离运行**（独立于客户端存活），输出写入应用旁的 `backend.log`，启动页超时会显示日志尾部供排障。
-3. 地址、超时等通过应用旁的 `config.json` 调整（首次运行会自动生成默认文件）：
+**后端命令解析顺序（本机安装优先）**：
+
+1. `config.json` 里的 `backend_command`（显式覆盖）
+2. **本机已安装的 Harness**：npx 缓存里的 dsh CLI（Windows: `%LOCALAPPDATA%\npm-cache\_npx`；macOS: `~/.npm/_npx`）或 npm 全局安装（`%APPDATA%\npm\node_modules` / `/usr/local/lib/node_modules`）→ `node <dsh>/lib/bin.js web`
+3. **内置后端**（随应用打包）：`backend/node`（Node 运行时）+ `backend/dsh`（官方 `@deepseek-ai/dsh`）→ `node <内置>/lib/bin.js web --port <harness_url 端口>`
+4. 兜底：Windows `cmd /C "dsh web || npx -y @deepseek-ai/dsh web"`，macOS/Linux `sh -c "dsh web || npx -y @deepseek-ai/dsh web"`
+
+后端进程**分离运行**（独立于客户端存活），输出写入应用旁的 `backend.log`，启动页超时会显示日志尾部供排障。
+地址、超时等通过应用旁的 `config.json` 调整（首次运行会自动生成默认文件）：
 
 ```json
 {
@@ -91,8 +95,7 @@ cargo build --release --target aarch64-apple-darwin
 | Windows x86_64 | `windows-latest` | NSIS 安装器 `.exe`（+MSI） |
 | macOS arm64 | `macos-14`（Apple Silicon） | `.app` + `.dmg` |
 
-- **推送 `v*` 标签**（如 `git tag v0.0.1 && git push --tags`）→ 自动构建并创建 GitHub Release，附带两个平台的安装包。
-- **手动触发**：Actions 页 → Build Desktop Apps → Run workflow（不创建 Release，产物在 Artifacts 中，保留 90 天）。
+- **推送 `v*` 标签** 或 **手动触发**（Actions 页 → Build Desktop Apps → Run workflow）→ 双平台构建（含内置后端打包），产物上传到 Artifacts（保留 90 天）；**不再自动发布 Release**。
 - 构建无需配置证书；macOS 产物未签名，首次打开需右键 → 打开（或 `xattr -dr com.apple.quarantine`）。
 
 ## 目录结构
@@ -101,15 +104,19 @@ cargo build --release --target aarch64-apple-darwin
 deeprein/
 ├── dist/                       # 本地启动页（连接检测/重试/退出）
 │   └── index.html
+├── backend/                    # 内置后端（scripts/bundle-backend.mjs 生成，不入库）
+│   ├── node/                   # Node 运行时（Windows: node.exe；macOS: bin/node）
+│   └── dsh/node_modules/       # 官方 @deepseek-ai/dsh 及其运行时依赖
 ├── src-tauri/                  # Rust + Tauri 工程
 │   ├── src/
 │   │   ├── main.rs             # 程序入口（隐藏控制台窗口）
-│   │   └── lib.rs              # 窗口创建 + open_harness/quit_app 命令
+│   │   └── lib.rs              # 窗口创建 + 后端解析/启动命令
 │   ├── icons/                  # 应用图标（脚本生成）
 │   ├── capabilities/default.json
 │   ├── Cargo.toml
 │   └── tauri.conf.json
 ├── scripts/
+│   ├── bundle-backend.mjs      # 下载 Node 运行时 + 安装官方 dsh（打包前运行）
 │   ├── generate-icons.ps1      # 重新生成图标
 │   └── build.ps1               # 构建辅助脚本
 └── package.json                # 仅供 @tauri-apps/cli 使用
