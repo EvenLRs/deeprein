@@ -1,5 +1,5 @@
-# 构建 DSH Native Client
-#   -Mode Release    仅编译 release exe（最快，产物在 src-tauri\target\release\dsh-native-client.exe）
+# 构建 deeprein
+#   -Mode Release    仅编译 release exe（最快，产物在 src-tauri\target\release\deeprein.exe）
 #   -Mode Installer  编译并打包 NSIS 安装程序（需要 Node/npm，产物在 src-tauri\target\release\bundle\nsis\）
 #   -SkipNpmInstall  打包时跳过 npm install（已安装过 @tauri-apps/cli 时用）
 param(
@@ -32,7 +32,7 @@ try {
         Write-Host "==> cargo build --release"
         cargo build --release
         if ($LASTEXITCODE -ne 0) { throw "cargo 编译失败（exit $LASTEXITCODE）" }
-        $exe = Join-Path (Get-Location) 'target\release\dsh-native-client.exe'
+        $exe = Join-Path (Get-Location) 'target\release\deeprein.exe'
         Write-Host "`n构建成功：$exe" -ForegroundColor Green
     }
     else {

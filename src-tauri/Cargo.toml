@@ -1,13 +1,13 @@
 [package]
-name = "dsh-native-client"
-version = "0.1.0"
-description = "Windows 原生桌面客户端：DeepSeek Harness Web GUI 的桌面外壳"
-authors = ["dsh"]
+name = "deeprein"
+version = "0.0.1"
+description = "deeprein 桌面客户端：DeepSeek Harness Web GUI 的桌面外壳"
+authors = ["EvenLRs"]
 edition = "2021"
 rust-version = "1.77.2"
 
 [lib]
-name = "dsh_native_client_lib"
+name = "deeprein_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

@@ -1,4 +1,4 @@
-# DSH Native Client — DeepSeek Harness 桌面客户端
+# deeprein — DeepSeek Harness 桌面客户端
 
 一个基于 **Rust + Tauri v2** 的原生桌面应用，把本机运行的
 [DeepSeek Harness](http://127.0.0.1:3080) Web GUI 包装成独立的桌面窗口应用。
@@ -91,14 +91,14 @@ cargo build --release --target aarch64-apple-darwin
 | Windows x86_64 | `windows-latest` | NSIS 安装器 `.exe`（+MSI） |
 | macOS arm64 | `macos-14`（Apple Silicon） | `.app` + `.dmg` |
 
-- **推送 `v*` 标签**（如 `git tag v0.1.0 && git push --tags`）→ 自动构建并创建 GitHub Release，附带两个平台的安装包。
+- **推送 `v*` 标签**（如 `git tag v0.0.1 && git push --tags`）→ 自动构建并创建 GitHub Release，附带两个平台的安装包。
 - **手动触发**：Actions 页 → Build Desktop Apps → Run workflow（不创建 Release，产物在 Artifacts 中，保留 90 天）。
 - 构建无需配置证书；macOS 产物未签名，首次打开需右键 → 打开（或 `xattr -dr com.apple.quarantine`）。
 
 ## 目录结构
 
 ```
-dsh-native-client/
+deeprein/
 ├── dist/                       # 本地启动页（连接检测/重试/退出）
 │   └── index.html
 ├── src-tauri/                  # Rust + Tauri 工程
@@ -121,7 +121,7 @@ dsh-native-client/
 
 ```powershell
 .\scripts\build.ps1 -Mode Release
-# 产物：src-tauri\target\release\dsh-native-client.exe
+# 产物：src-tauri\target\release\deeprein.exe
 ```
 
 或手动：

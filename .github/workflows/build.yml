@@ -55,7 +55,7 @@ jobs:
       - name: Upload bundle
         uses: actions/upload-artifact@v4
         with:
-          name: dsh-native-client-${{ matrix.label }}
+          name: deeprein-${{ matrix.label }}
           path: |
             src-tauri/target/${{ matrix.target }}/release/bundle/**/*
           if-no-files-found: error

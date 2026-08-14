@@ -300,7 +300,7 @@ pub fn run() {
                 config: Mutex::new(load_config()),
             });
             let win = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-                .title("DeepSeek Harness")
+                .title("deeprein")
                 .inner_size(1280.0, 860.0)
                 .min_inner_size(960.0, 640.0)
                 .center()

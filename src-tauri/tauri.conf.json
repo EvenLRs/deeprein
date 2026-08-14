@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "DSH Native Client",
-  "version": "0.1.0",
-  "identifier": "com.dsh.native-client",
+  "productName": "deeprein",
+  "version": "0.0.1",
+  "identifier": "com.deeprein.client",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://127.0.0.1:3080"
