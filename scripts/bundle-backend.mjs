@@ -31,9 +31,27 @@ function sh(cmd, args, opts = {}) {
   }
 }
 
+// 用 node + npm-cli.js 调 npm：Windows 上裸 'npm' 可能被 .ps1 遮蔽导致 spawn 失败
+function npmCli() {
+  const p = join(dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
+  return existsSync(p) ? p : null;
+}
+
+function runNpm(args, opts = {}) {
+  const cli = npmCli();
+  if (cli) {
+    sh(process.execPath, [cli, ...args], opts);
+  } else {
+    sh('npm', args, opts);
+  }
+}
+
 // npm 11+ 才有 allowScripts 机制（默认跳过未批准脚本，需 approve + rebuild）；npm 10 直接执行
 function npmMajor() {
-  const r = spawnSync('npm', ['--version'], { encoding: 'utf8' });
+  const cli = npmCli();
+  const r = cli
+    ? spawnSync(process.execPath, [cli, '--version'], { encoding: 'utf8' })
+    : spawnSync('npm', ['--version'], { encoding: 'utf8' });
   const m = parseInt((r.stdout || '').trim().split('.')[0], 10);
   return Number.isFinite(m) ? m : 0;
 }
@@ -55,10 +73,9 @@ mkdirSync(backend, { recursive: true });
 
 // ---- 1. Node 运行时 ----
 const nodeDir = join(backend, 'node');
-mkdirSync(nodeDir, { recursive: true });
-
 let nodeExe;
 if (platform === 'win32') {
+  mkdirSync(nodeDir, { recursive: true });
   const name = `node-${NODE_VERSION}-win-x64`;
   if (!existsSync(join(nodeDir, 'node.exe'))) {
     const zip = join(backend, `${name}.zip`);
@@ -76,8 +93,8 @@ if (platform === 'win32') {
     const tgz = join(backend, `${name}.tar.gz`);
     await download(`https://nodejs.org/dist/${NODE_VERSION}/${name}.tar.gz`, tgz);
     sh('tar', ['-xzf', tgz]);
-    renameSync(join(backend, name, 'bin'), join(nodeDir, 'bin'));
-    rmSync(join(backend, name), { recursive: true, force: true });
+    // 整体移动发行目录：bin/ 内含指向 ../lib 的符号链接（corepack/npm/npx），必须保留
+    renameSync(join(backend, name), nodeDir);
     rmSync(tgz, { force: true });
   }
   nodeExe = join(nodeDir, 'bin', 'node');
@@ -91,7 +108,7 @@ mkdirSync(dshDir, { recursive: true });
 const dshBin = join(dshDir, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
 if (!existsSync(dshBin)) {
   console.log(`[npm] 安装 @deepseek-ai/dsh@${DSH_VERSION} ...`);
-  sh('npm', [
+  runNpm([
     'install',
     '--prefix',
     dshDir,
@@ -103,8 +120,8 @@ if (!existsSync(dshBin)) {
   ]);
   // npm 11 的 allowScripts 机制默认跳过未批准的安装脚本（node-pty/koffi 等原生包依赖它们）
   if (npmMajor() >= 11) {
-    sh('npm', ['approve-scripts', '--all'], { cwd: dshDir });
-    sh('npm', ['rebuild'], { cwd: dshDir });
+    runNpm(['approve-scripts', '--all'], { cwd: dshDir });
+    runNpm(['rebuild'], { cwd: dshDir });
   }
 }
 
