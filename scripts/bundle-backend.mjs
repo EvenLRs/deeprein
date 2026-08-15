@@ -79,10 +79,11 @@ function pruneBackendPlatform(dshDir, nodeDir, platform, arch) {
     }
   }
 
-  // 3) Node 发行目录:include 头文件 + npm 文档
+  // 3) Node 发行目录:include 头文件 + npm 文档(macOS: lib/...;Windows: 根下 node_modules/...)
   if (nodeDir) {
     prune(join(nodeDir, 'include'));
     prune(join(nodeDir, 'lib', 'node_modules', 'npm', 'docs'));
+    prune(join(nodeDir, 'node_modules', 'npm', 'docs'));
   }
 
   const mb = (removed / 1024 / 1024).toFixed(1);
@@ -189,7 +190,6 @@ mkdirSync(backend, { recursive: true });
 const nodeDir = join(backend, 'node');
 let nodeExe;
 if (platform === 'win32') {
-  mkdirSync(nodeDir, { recursive: true });
   const name = `node-${NODE_VERSION}-win-x64`;
   if (!existsSync(join(nodeDir, 'node.exe'))) {
     const zip = join(backend, `${name}.zip`);
@@ -198,6 +198,8 @@ if (platform === 'win32') {
     sh('tar', ['-xf', zip]);
     // 整体移动发行目录：node_modules/npm 与 corepack 一并保留，
     // 供运行时更新脚本（ensure-backend.mjs）在无系统 npm 的机器上安装/更新后端
+    // Windows 的 rename 不能覆盖已存在的目录（EPERM），先移除空的目标目录
+    rmSync(nodeDir, { recursive: true, force: true });
     renameSync(join(backend, name), nodeDir);
     rmSync(zip, { force: true });
   }
@@ -209,6 +211,8 @@ if (platform === 'win32') {
     await download(`https://nodejs.org/dist/${NODE_VERSION}/${name}.tar.gz`, tgz);
     sh('tar', ['-xzf', tgz]);
     // 整体移动发行目录：bin/ 内含指向 ../lib 的符号链接（corepack/npm/npx），必须保留
+    // 目标目录若存在（残留/占位）先移除，避免 rename 失败（Windows EPERM / POSIX ENOTEMPTY）
+    rmSync(nodeDir, { recursive: true, force: true });
     renameSync(join(backend, name), nodeDir);
     rmSync(tgz, { force: true });
   }
