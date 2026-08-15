@@ -8,20 +8,22 @@
 
 - 🪟 **原生窗口**：Windows 用 WebView2、macOS 用 WKWebView（系统内核），无捆绑浏览器，安装包小、内存占用低。
 - 🔌 **连接检测 + 自动启动后端**：启动时自动探测 Harness（默认 `127.0.0.1:3080`）；未运行时自动拉起 `dsh web` 后端并等待就绪，失败时给出友好提示与重试。
-- 📦 **内置官方 Harness 后端**：应用自带 Node 运行时 + 官方 `@deepseek-ai/dsh` 包——本机已安装则优先用本机，未安装则自动启动内置后端，开箱即用。
+- 🔄 **自动检查更新 + 同步最新版**：每次启动先联网查询 npm registry 上 `@deepseek-ai/dsh` 的最新版本；发现新版本会在启动页提醒并自动下载安装到应用数据目录（首次启动若无后端则直接联网获取最新版）。离线或检查失败时静默跳过，不影响启动。
+- 📦 **内置官方 Harness 后端**：应用自带 Node 运行时 + 官方 `@deepseek-ai/dsh` 包作为离线兜底（打包时跟随 npm 最新版，不再写死版本）——本机已安装则优先用本机，未安装则自动启动内置后端，开箱即用。
 - 🎨 **深色启动页**：原生 UI 质感，检测成功后自动导航进入 Harness。
-- ⚙️ **可配置**：应用旁的 `config.json` 可改地址、启动命令、超时等。
+- ⚙️ **可配置**：应用旁的 `config.json` 可改地址、启动命令、超时、更新开关等。
 
 ## 自动启动后端
 
 应用检测不到 Harness 时，会自动执行后端启动命令并轮询等待服务就绪，然后进入 GUI。
 
-**后端命令解析顺序（本机安装优先）**：
+**后端命令解析顺序（应用管理目录优先，自动跟随最新版）**：
 
 1. `config.json` 里的 `backend_command`（显式覆盖）
-2. **本机已安装的 Harness**：npx 缓存里的 dsh CLI（Windows: `%LOCALAPPDATA%\npm-cache\_npx`；macOS: `~/.npm/_npx`）或 npm 全局安装（`%APPDATA%\npm\node_modules` / `/usr/local/lib/node_modules`）→ `node <dsh>/lib/bin.js web`
-3. **内置后端**（随应用打包）：`backend/node`（Node 运行时）+ `backend/dsh`（官方 `@deepseek-ai/dsh`）→ `node <内置>/lib/bin.js web --port <harness_url 端口>`
-4. 兜底：Windows `cmd /C "dsh web || npx -y @deepseek-ai/dsh web"`，macOS/Linux `sh -c "dsh web || npx -y @deepseek-ai/dsh web"`
+2. **应用管理的后端**（自动更新生成）：`<应用数据目录>/backend/dsh`（macOS `~/Library/Application Support/com.deeprein.client/backend`、Windows `%APPDATA%\com.deeprein.client\backend`）→ `node <该目录>/lib/bin.js web`
+3. **本机已安装的 Harness**：npx 缓存里的 dsh CLI（Windows: `%LOCALAPPDATA%\npm-cache\_npx`；macOS: `~/.npm/_npx`）或 npm 全局安装（`%APPDATA%\npm\node_modules` / `/usr/local/lib/node_modules`）→ `node <dsh>/lib/bin.js web`
+4. **内置后端**（随应用打包的离线兜底）：`backend/node`（Node 运行时）+ `backend/dsh`（官方 `@deepseek-ai/dsh`）→ `node <内置>/lib/bin.js web --port <harness_url 端口>`
+5. 兜底：Windows `cmd /C "dsh web || npx -y @deepseek-ai/dsh web"`，macOS/Linux `sh -c "dsh web || npx -y @deepseek-ai/dsh web"`
 
 后端进程**分离运行**（独立于客户端存活），输出写入应用旁的 `backend.log`，启动页超时会显示日志尾部供排障。
 地址、超时等通过应用旁的 `config.json` 调整（首次运行会自动生成默认文件）：
@@ -34,7 +36,11 @@
   "auto_start_backend": true,
   "start_timeout_sec": 90,
   "start_check_interval_ms": 1500,
-  "backend_log_file": "backend.log"
+  "backend_log_file": "backend.log",
+  "check_updates": true,
+  "auto_update": true,
+  "update_timeout_sec": 600,
+  "registry_url": "https://registry.npmjs.org/@deepseek-ai/dsh"
 }
 ```
 
@@ -43,6 +49,17 @@
 ```json
 { "backend_command": ["C:\\Program Files\\nodejs\\node.exe", "C:\\path\\to\\bin.js", "web"] }
 ```
+
+## 自动检查更新
+
+每次启动进入 GUI 前，客户端都会先联网查询 npm registry 上 `@deepseek-ai/dsh` 的最新版本：
+
+- **版本不再写死**：打包脚本（`scripts/bundle-backend.mjs`）构建时联网取最新版（可用 `--version=x.y.z` 或环境变量 `DSH_VERSION` 覆盖）；运行时脚本（`scripts/ensure-backend.mjs`）负责首次安装与后续更新。
+- **首次启动**：若本机/内置后端都没有，直接联网下载安装最新版到应用数据目录。
+- **后续启动**：已安装版本落后于最新版时，启动页提醒「发现新版本 vX」并自动同步安装（`auto_update: true` 默认行为）；设为 `false` 则提供「立即更新 / 跳过更新」按钮。
+- **离线兜底**：检查失败（离线、缺少 Node）不阻塞启动，继续走内置/本机后端；`check_updates: false` 可完全关闭检查。
+- **更新生效时机**：更新安装到应用数据目录，随后启动的后端进程即使用新版；若 Harness 后端已在运行（旧进程仍在内存中），新版将在下次后端启动时生效。
+- **进度与排障**：安装进度实时显示在启动页；完整日志在应用数据目录的 `backend/update.log`。
 
 ## 环境要求
 
@@ -119,7 +136,8 @@ deeprein/
 │   ├── Cargo.toml
 │   └── tauri.conf.json
 ├── scripts/
-│   ├── bundle-backend.mjs      # 下载 Node 运行时 + 安装官方 dsh（打包前运行）
+│   ├── bundle-backend.mjs      # 下载 Node 运行时 + 安装官方 dsh（打包前运行；构建时取 npm 最新版）
+│   ├── ensure-backend.mjs      # 运行时后端安装/更新脚本（内嵌进客户端，首次启动安装最新版、日常检查更新）
 │   ├── generate-icons.ps1      # 重新生成图标
 │   └── build.ps1               # 构建辅助脚本
 └── package.json                # 仅供 @tauri-apps/cli 使用

@@ -113,6 +113,8 @@
     </div>
 
     <div class="actions">
+      <button id="update" class="primary hidden">立即更新</button>
+      <button id="update-skip" class="hidden">跳过更新</button>
       <button id="retry" class="primary hidden">重试</button>
       <button id="start" class="hidden">启动后端</button>
       <button id="open" class="hidden">仍然打开</button>
@@ -139,6 +141,9 @@
       start_timeout_sec: 90,
       start_check_interval_ms: 1500,
       backend_command: null,
+      check_updates: true,
+      auto_update: true,
+      update_timeout_sec: 600,
     };
 
     let cfg = { ...DEFAULTS };
@@ -150,6 +155,8 @@
     let startedBackend = false;
     let startingBackend = false;
     let startDeadline = 0;
+    let mainStarted = false;
+    let pendingUpdateChoice = false;
 
     function setStatus(text, ok, cmdText) {
       $('status').classList.remove('hidden');
@@ -278,6 +285,108 @@
       } catch { return null; }
     }
 
+    // ---------- DeepSeek Harness 更新检查 / 自动同步 ----------
+
+    async function doInstall() {
+      // 轮询 update.log 尾部展示安装进度
+      const poll = setInterval(async () => {
+        try {
+          const tail = await tauri().invoke('read_update_log', { lines: 1 });
+          if (tail && tail !== '(日志尚未生成)') {
+            $('status-cmd').textContent = tail.trim().split('\n').pop();
+            $('status-cmd').classList.remove('hidden');
+          }
+        } catch { /* 忽略 */ }
+      }, 900);
+      try {
+        const r = await tauri().invoke('install_update');
+        await log('doInstall(): install_update 返回 ' + JSON.stringify(r));
+        if (r && r.ok && r.updated) {
+          setStatus('DeepSeek Harness 已更新至 v' + r.latest + '，准备启动…', true);
+        } else if (r && r.ok) {
+          setStatus('DeepSeek Harness 已是最新版本', true);
+        } else {
+          await log('doInstall(): 更新未完成 ' + (r && r.error ? r.error : ''));
+          setStatus('更新未完成，继续启动…', false, '详见 update.log');
+        }
+      } catch (e) {
+        await log('doInstall(): 更新失败 ' + (e && e.message ? e.message : e));
+        setStatus('更新失败，继续启动…', false, String(e && e.message ? e.message : e));
+      } finally {
+        clearInterval(poll);
+      }
+    }
+
+    // 每次启动先检查更新：有新版则提醒并（按配置）自动同步安装
+    async function runUpdateFlow() {
+      try {
+        const info = await tauri().invoke('get_update_info');
+        await log('update: get_update_info ' + JSON.stringify(info));
+        cfg.check_updates = !!info.check_updates;
+        cfg.auto_update = !!info.auto_update;
+        if (!cfg.check_updates) return; // 配置关闭更新检查
+
+        setStatus('正在检查 DeepSeek Harness 更新…', false, info.current_version ? '当前版本 v' + info.current_version : '');
+
+        const res = await tauri().invoke('check_update');
+        await log('update: check_update ' + JSON.stringify(res));
+        if (!res || !res.ok) {
+          await log('update: 检查未完成（可能离线或缺少 Node）：' + (res && res.error ? res.error : ''));
+          return; // 离线等异常不阻塞启动
+        }
+        if (!res.update_available) {
+          const v = res.current || res.latest;
+          setStatus('DeepSeek Harness 已是最新版本' + (v ? ' (v' + v + ')' : ''), true);
+          return;
+        }
+
+        // 有新版本：提醒用户
+        if (res.current) {
+          setStatus('发现 DeepSeek Harness 新版本 v' + res.latest + '（当前 v' + res.current + '）', true);
+        } else {
+          setStatus('首次启动：正在准备获取最新 DeepSeek Harness v' + res.latest, true);
+        }
+
+        if (!cfg.auto_update) {
+          // 不自动更新：提供「立即更新 / 跳过」选择
+          await log('update: auto_update=false，等待用户选择');
+          pendingUpdateChoice = true;
+          $('update').classList.remove('hidden');
+          $('update-skip').classList.remove('hidden');
+          return;
+        }
+        await log('update: 自动同步更新 ' + res.current + ' → ' + res.latest);
+        setStatus('发现新版本 v' + res.latest + '，正在自动同步更新…', false, res.current ? res.current + ' → ' + res.latest : '');
+        await doInstall();
+      } catch (e) {
+        await log('update: 流程异常 ' + (e && e.message ? e.message : e));
+      }
+    }
+
+    function startMain() {
+      if (mainStarted || opened) return;
+      mainStarted = true;
+      pendingUpdateChoice = false;
+      $('update').classList.add('hidden');
+      $('update-skip').classList.add('hidden');
+      $('status-cmd').classList.add('hidden');
+      timer = setInterval(tick, cfg.start_check_interval_ms);
+      tick();
+    }
+
+    $('update').onclick = async () => {
+      $('update').classList.add('hidden');
+      $('update-skip').classList.add('hidden');
+      setStatus('正在同步更新 DeepSeek Harness…', false, '首次更新需下载依赖，可能耗时数分钟');
+      await doInstall();
+      startMain();
+    };
+    $('update-skip').onclick = () => {
+      $('update').classList.add('hidden');
+      $('update-skip').classList.add('hidden');
+      setStatus('已跳过本次更新，正在启动…');
+      startMain();
+    };
     $('retry').onclick = () => {
       stopped = false;
       startedBackend = false;
@@ -317,8 +426,12 @@
       }
       HARNESS = cfg.harness_url;
       await log('init(): HARNESS=' + HARNESS + ' auto_start=' + cfg.auto_start_backend + ' interval=' + cfg.start_check_interval_ms);
-      timer = setInterval(tick, cfg.start_check_interval_ms);
-      tick();
+      // 每次启动先检查 Harness 更新（有新版本则提醒/自动同步），再进入常规检测流程
+      if (tauri()) {
+        await runUpdateFlow();
+        if (pendingUpdateChoice) return; // 等待用户选择「立即更新 / 跳过更新」
+      }
+      startMain();
     })();
   </script>
 </body>

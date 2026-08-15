@@ -4,21 +4,50 @@
 //   backend/node/node.exe          (Windows) / backend/node/bin/node (macOS)
 //   backend/dsh/node_modules/...   官方 dsh 包及其运行时依赖
 import { spawnSync } from 'node:child_process';
-import {
-  existsSync,
-  mkdirSync,
-  rmSync,
-  copyFileSync,
-  renameSync,
-  writeFileSync,
-} from 'node:fs';
+import { existsSync, mkdirSync, rmSync, renameSync, writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const DSH_VERSION = '0.1.0-rc.6'; // 官方 @deepseek-ai/dsh 版本
+// 官方 @deepseek-ai/dsh 版本解析（不再写死）：
+//   1) 命令行 --version=x.y.z 显式指定（可复现构建）
+//   2) 环境变量 DSH_VERSION
+//   3) 联网获取 npm registry 的最新版本（默认行为，构建时跟随最新版）
+//   4) 网络失败时回退到 FALLBACK_DSH_VERSION
+const FALLBACK_DSH_VERSION = '0.1.0-rc.6';
 const NODE_VERSION = 'v24.18.0';
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const backend = join(root, 'backend');
+
+function resolveDshVersion(argv) {
+  const cliArg = argv.find((a) => a.startsWith('--version='));
+  if (cliArg) {
+    const v = cliArg.split('=')[1].trim();
+    if (v) {
+      console.log(`[版本] 使用命令行指定版本 ${v}`);
+      return v;
+    }
+  }
+  if (process.env.DSH_VERSION) {
+    console.log(`[版本] 使用环境变量 DSH_VERSION=${process.env.DSH_VERSION}`);
+    return process.env.DSH_VERSION.trim();
+  }
+  return null;
+}
+
+async function latestDshVersion() {
+  try {
+    const res = await fetch('https://registry.npmjs.org/@deepseek-ai/dsh/latest', {
+      redirect: 'follow',
+    });
+    if (!res.ok) throw new Error(`registry HTTP ${res.status}`);
+    const json = await res.json();
+    if (!json || typeof json.version !== 'string') throw new Error('registry 响应缺少 version');
+    return json.version;
+  } catch (e) {
+    console.warn(`[警告] 获取 npm 最新版本失败（${e.message}），回退到 ${FALLBACK_DSH_VERSION}`);
+    return FALLBACK_DSH_VERSION;
+  }
+}
 
 const platform = process.platform; // win32 | darwin
 const arch = process.arch; // x64 | arm64
@@ -82,8 +111,9 @@ if (platform === 'win32') {
     await download(`https://nodejs.org/dist/${NODE_VERSION}/${name}.zip`, zip);
     // Windows 自带 bsdtar，支持 zip
     sh('tar', ['-xf', zip]);
-    copyFileSync(join(backend, name, 'node.exe'), join(nodeDir, 'node.exe'));
-    rmSync(join(backend, name), { recursive: true, force: true });
+    // 整体移动发行目录：node_modules/npm 与 corepack 一并保留，
+    // 供运行时更新脚本（ensure-backend.mjs）在无系统 npm 的机器上安装/更新后端
+    renameSync(join(backend, name), nodeDir);
     rmSync(zip, { force: true });
   }
   nodeExe = join(nodeDir, 'node.exe');
@@ -103,16 +133,18 @@ if (platform === 'win32') {
 }
 
 // ---- 2. 官方 dsh 包 ----
+const dshVersion = resolveDshVersion(process.argv.slice(2)) ?? (await latestDshVersion());
+console.log(`[版本] 使用 @deepseek-ai/dsh@${dshVersion}`);
 const dshDir = join(backend, 'dsh');
 mkdirSync(dshDir, { recursive: true });
 const dshBin = join(dshDir, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
 if (!existsSync(dshBin)) {
-  console.log(`[npm] 安装 @deepseek-ai/dsh@${DSH_VERSION} ...`);
+  console.log(`[npm] 安装 @deepseek-ai/dsh@${dshVersion} ...`);
   runNpm([
     'install',
     '--prefix',
     dshDir,
-    `@deepseek-ai/dsh@${DSH_VERSION}`,
+    `@deepseek-ai/dsh@${dshVersion}`,
     '--omit=dev',
     '--no-audit',
     '--no-fund',
@@ -128,7 +160,7 @@ if (!existsSync(dshBin)) {
 // ---- 3. 元信息 ----
 writeFileSync(
   join(backend, 'bundle-info.json'),
-  JSON.stringify({ dsh: DSH_VERSION, node: NODE_VERSION, platform, arch }, null, 2),
+  JSON.stringify({ dsh: dshVersion, node: NODE_VERSION, platform, arch }, null, 2),
 );
 
 console.log('[OK] 后端已打包');

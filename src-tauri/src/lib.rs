@@ -1,15 +1,22 @@
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
-use std::time::SystemTime;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 /// 默认 Harness Web GUI 地址
 const DEFAULT_HARNESS_URL: &str = "http://127.0.0.1:3080";
+
+/// 默认 npm registry 上 dsh 包的地址（版本查询用）
+const DEFAULT_REGISTRY_URL: &str = "https://registry.npmjs.org/@deepseek-ai/dsh";
+
+/// 运行时安装/更新后端脚本（scripts/ensure-backend.mjs），随二进制内嵌，无需额外资源文件
+const ENSURE_BACKEND_JS: &str = include_str!("../../scripts/ensure-backend.mjs");
 
 /// 客户端配置（读取 exe 旁的 config.json；缺省用内置默认值）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +36,14 @@ struct ClientConfig {
     start_check_interval_ms: u64,
     /// 后端日志文件名（相对 exe 目录）
     backend_log_file: String,
+    /// 每次启动时联网检查 DeepSeek Harness 更新
+    check_updates: bool,
+    /// 发现新版本时自动下载安装（同步更新）
+    auto_update: bool,
+    /// 安装/更新后端的超时（秒；首次安装需下载全部依赖，可适当放宽）
+    update_timeout_sec: u64,
+    /// npm registry 上 dsh 包的地址（版本查询用）
+    registry_url: String,
 }
 
 impl Default for ClientConfig {
@@ -41,6 +56,10 @@ impl Default for ClientConfig {
             start_timeout_sec: 90,
             start_check_interval_ms: 1500,
             backend_log_file: "backend.log".into(),
+            check_updates: true,
+            auto_update: true,
+            update_timeout_sec: 600,
+            registry_url: DEFAULT_REGISTRY_URL.to_string(),
         }
     }
 }
@@ -49,6 +68,8 @@ struct AppState {
     config: Mutex<ClientConfig>,
     /// Tauri 资源目录（打包时 bundle.resources 的落点，macOS 为 .app/Contents/Resources）
     resource_dir: PathBuf,
+    /// 应用数据目录（自动更新后的后端存放于此，可写；如 macOS ~/Library/Application Support/com.deeprein.client）
+    app_data_dir: PathBuf,
 }
 
 #[derive(Serialize)]
@@ -65,6 +86,46 @@ struct BackendStartResult {
     started: bool,
     pid: Option<u32>,
     command: String,
+}
+
+/// 当前后端版本与更新开关信息（启动页展示用）
+#[derive(Serialize)]
+struct UpdateInfo {
+    check_updates: bool,
+    auto_update: bool,
+    update_timeout_sec: u64,
+    registry_url: String,
+    /// 当前可用后端的版本（应用管理目录 → 内置 → 本机安装）
+    current_version: Option<String>,
+    /// 版本来源：managed | bundled | local | none
+    current_source: String,
+}
+
+/// 更新检查/安装结果（与 ensure-backend.mjs 的 RESULT 行同构）
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct UpdateCheck {
+    ok: bool,
+    checked: bool,
+    current: Option<String>,
+    latest: Option<String>,
+    update_available: bool,
+    updated: bool,
+    error: Option<String>,
+}
+
+impl Default for UpdateCheck {
+    fn default() -> Self {
+        Self {
+            ok: false,
+            checked: false,
+            current: None,
+            latest: None,
+            update_available: false,
+            updated: false,
+            error: None,
+        }
+    }
 }
 
 fn exe_dir() -> PathBuf {
@@ -162,68 +223,279 @@ fn normalize_path(s: &str) -> String {
     s.to_string()
 }
 
-/// 随应用打包的官方 Harness 后端（backend/node + backend/dsh）
-fn bundled_backend(resource_dir: &Path, harness_url: &str) -> Option<Vec<String>> {
-    // 打包器对含 ".." 的资源路径（如 ../backend）会映射为 _up_/backend；
-    // resource_dir() 本身不含 _up_，因此多候选根目录兜底：
-    //  1) resource_dir/_up_/backend   —— tauri 打包后的正式布局（macOS/Windows）
-    //  2) resource_dir/backend        —— 无 ".." 的资源配置或手动放置
-    //  3) exe_dir/backend             —— 开发构建/手动复制到 exe 旁
-    let mut roots = vec![
+/// 随应用打包的后端（backend/node + backend/dsh）候选根目录。
+/// 打包器对含 ".." 的资源路径（如 ../backend）会映射为 _up_/backend；
+/// resource_dir() 本身不含 _up_，因此多候选根目录兜底：
+///  1) resource_dir/_up_/backend   —— tauri 打包后的正式布局（macOS/Windows）
+///  2) resource_dir/backend        —— 无 ".." 的资源配置或手动放置
+///  3) exe_dir/backend             —— 开发构建/手动复制到 exe 旁
+fn bundled_roots(resource_dir: &Path) -> Vec<PathBuf> {
+    vec![
         resource_dir.join("_up_").join("backend"),
         resource_dir.join("backend"),
         exe_dir().join("backend"),
-    ];
+    ]
+}
 
+/// 内置后端里 Node 可执行文件的相对路径
+fn bundled_node_rel() -> PathBuf {
     #[cfg(windows)]
-    let node_rel = ["node", "node.exe"].iter().collect::<PathBuf>();
+    let rel = ["node", "node.exe"].iter().collect::<PathBuf>();
     #[cfg(not(windows))]
-    let node_rel = ["node", "bin", "node"].iter().collect::<PathBuf>();
-    let bin_rel = ["dsh", "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js"]
-        .iter()
-        .collect::<PathBuf>();
+    let rel = ["node", "bin", "node"].iter().collect::<PathBuf>();
+    rel
+}
 
-    for root in &mut roots {
-        let node = root.join(&node_rel);
-        let bin = root.join(&bin_rel);
+/// 内置后端里 dsh CLI 入口的相对路径
+fn dsh_bin_rel() -> PathBuf {
+    ["dsh", "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js"]
+        .iter()
+        .collect::<PathBuf>()
+}
+
+/// 让后端服务与 harness_url 相同的端口
+fn push_port(cmd: &mut Vec<String>, harness_url: &str) {
+    if let Ok(url) = harness_url.parse::<tauri::Url>() {
+        if let Some(port) = url.port() {
+            cmd.push("--port".into());
+            cmd.push(port.to_string());
+        }
+    }
+}
+
+/// 随应用打包的官方 Harness 后端（backend/node + backend/dsh）
+fn bundled_backend(resource_dir: &Path, harness_url: &str) -> Option<Vec<String>> {
+    for root in bundled_roots(resource_dir) {
+        let node = root.join(bundled_node_rel());
+        let bin = root.join(dsh_bin_rel());
         if node.exists() && bin.exists() {
             let mut cmd = vec![
                 normalize_path(&node.to_string_lossy()),
                 normalize_path(&bin.to_string_lossy()),
                 "web".into(),
             ];
-            // 让内置后端服务与 harness_url 相同的端口
-            if let Ok(url) = harness_url.parse::<tauri::Url>() {
-                if let Some(port) = url.port() {
-                    cmd.push("--port".into());
-                    cmd.push(port.to_string());
-                }
-            }
+            push_port(&mut cmd, harness_url);
             return Some(cmd);
         }
     }
     None
 }
 
+/// 应用管理的后端（自动更新安装到 app_data_dir/backend，可写）
+fn managed_backend(
+    app_data_dir: &Path,
+    resource_dir: &Path,
+    harness_url: &str,
+) -> Option<Vec<String>> {
+    let bin = app_data_dir.join("backend").join(dsh_bin_rel());
+    if !bin.exists() {
+        return None;
+    }
+    let node = find_update_node(resource_dir)?;
+    let mut cmd = vec![
+        normalize_path(&node),
+        normalize_path(&bin.to_string_lossy()),
+        "web".into(),
+    ];
+    push_port(&mut cmd, harness_url);
+    Some(cmd)
+}
+
+/// 读取 package.json 的 version 字段
+fn read_pkg_version(pkg_path: &Path) -> Option<String> {
+    let text = fs::read_to_string(pkg_path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    v.get("version").and_then(|x| x.as_str()).map(String::from)
+}
+
+/// 读取 bundle-info.json 的 dsh 版本字段（打包脚本与更新脚本都会写入）
+fn read_bundle_info_version(info_path: &Path) -> Option<String> {
+    let text = fs::read_to_string(info_path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    v.get("dsh").and_then(|x| x.as_str()).map(String::from)
+}
+
+/// 定位可运行 ensure-backend.mjs 的 Node：内置（自带 npm，优先）→ 本机 PATH/标准目录
+fn find_update_node(resource_dir: &Path) -> Option<String> {
+    for root in bundled_roots(resource_dir) {
+        let node = root.join(bundled_node_rel());
+        if node.exists() {
+            return Some(normalize_path(&node.to_string_lossy()));
+        }
+    }
+    // find_node() 总返回 Some（兜底 "node"），交由脚本自行找 npm
+    find_node()
+}
+
+/// 当前可用的后端版本与来源：应用管理目录 → 内置 → 本机安装 → 无
+fn current_backend_version(
+    app_data_dir: &Path,
+    resource_dir: &Path,
+) -> (Option<String>, &'static str) {
+    let managed_pkg = app_data_dir
+        .join("backend")
+        .join("dsh")
+        .join("node_modules")
+        .join("@deepseek-ai")
+        .join("dsh")
+        .join("package.json");
+    if let Some(v) = read_pkg_version(&managed_pkg) {
+        return (Some(v), "managed");
+    }
+    for root in bundled_roots(resource_dir) {
+        if let Some(v) = read_bundle_info_version(&root.join("bundle-info.json")) {
+            return (Some(v), "bundled");
+        }
+    }
+    if let Some(bin) = find_dsh_bin() {
+        // .../node_modules/@deepseek-ai/dsh/lib/bin.js → package.json 在 dsh/ 目录下
+        let pkg = Path::new(&bin)
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|d| d.join("package.json"));
+        if let Some(p) = pkg {
+            if let Some(v) = read_pkg_version(&p) {
+                return (Some(v), "local");
+            }
+        }
+    }
+    (None, "none")
+}
+
+/// 运行 ensure-backend.mjs（内嵌脚本），check_only=true 仅查版本，否则安装/更新。
+/// 输出写入 app_data_dir/backend/update.log；解析最后的 RESULT 行返回。
+fn run_update_script(
+    cfg: &ClientConfig,
+    resource_dir: &Path,
+    app_data_dir: &Path,
+    check_only: bool,
+) -> Result<UpdateCheck, String> {
+    let node = find_update_node(resource_dir).ok_or_else(|| {
+        "未找到可用的 Node 运行时（内置 backend/node 或本机 node），无法联网检查/更新 Harness"
+            .to_string()
+    })?;
+    let target = app_data_dir.join("backend");
+    fs::create_dir_all(&target)
+        .map_err(|e| format!("无法创建后端数据目录 {}: {e}", target.display()))?;
+
+    // 每次运行前刷新内嵌脚本（脚本随客户端版本升级）
+    let script_path = target.join("ensure-backend.mjs");
+    fs::write(&script_path, ENSURE_BACKEND_JS)
+        .map_err(|e| format!("无法写入更新脚本 {}: {e}", script_path.display()))?;
+
+    let log_path = target.join("update.log");
+    let log_file = fs::File::create(&log_path)
+        .map_err(|e| format!("无法创建更新日志 {}: {e}", log_path.display()))?;
+    let stderr_log = log_file
+        .try_clone()
+        .map_err(|e| format!("更新日志句柄错误: {e}"))?;
+
+    let mut args = vec![
+        normalize_path(&script_path.to_string_lossy()),
+        "--target".into(),
+        normalize_path(&target.to_string_lossy()),
+        "--registry".into(),
+        cfg.registry_url.clone(),
+        "--node".into(),
+        node.clone(),
+    ];
+    if check_only {
+        args.push("--check-only".into());
+    }
+
+    let mut child = Command::new(&node)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(stderr_log))
+        .spawn()
+        .map_err(|e| format!("无法启动更新脚本 [{node}]: {e}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "无法读取更新脚本输出".to_string())?;
+    let child_mut = Arc::new(Mutex::new(child));
+
+    // 超时看护：超过 update_timeout_sec 杀掉脚本进程（首次安装可能下载数百 MB 依赖）
+    let timeout = Duration::from_secs(cfg.update_timeout_sec.max(30));
+    {
+        let watched = child_mut.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(timeout);
+            let _ = watched.lock().unwrap().kill();
+        });
+    }
+
+    let mut log_writer = log_file;
+    let mut result_line: Option<String> = None;
+    for line in BufReader::new(stdout).lines() {
+        match line {
+            Ok(l) => {
+                let _ = writeln!(log_writer, "{l}");
+                if let Some(payload) = l.strip_prefix("RESULT ") {
+                    result_line = Some(payload.to_string());
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let status = child_mut
+        .lock()
+        .unwrap()
+        .wait()
+        .map_err(|e| format!("等待更新脚本退出失败: {e}"))?;
+
+    if let Some(json) = result_line {
+        let mut parsed: UpdateCheck = serde_json::from_str(&json)
+            .map_err(|e| format!("更新脚本返回异常 [{json}]: {e}"))?;
+        parsed.checked = true;
+        return Ok(parsed);
+    }
+    let timed_out = !status.success();
+    Ok(UpdateCheck {
+        ok: false,
+        checked: true,
+        error: Some(if timed_out {
+            format!(
+                "更新/安装超时（{} 秒），详情见 {}",
+                timeout.as_secs(),
+                log_path.display()
+            )
+        } else {
+            format!("更新脚本未返回结果，详情见 {}", log_path.display())
+        }),
+        ..UpdateCheck::default()
+    })
+}
+
 /// 解析最终的后端启动命令：
-/// 配置覆盖 → 本机已安装的 Harness（优先）→ 内置（随应用打包）→ PATH/npx 兜底
-fn resolve_backend_command(cfg: &ClientConfig, resource_dir: &Path) -> Vec<String> {
+/// 配置覆盖 → 应用管理（自动更新目录，优先）→ 本机已安装 → 内置 → PATH/npx 兜底
+fn resolve_backend_command(
+    cfg: &ClientConfig,
+    resource_dir: &Path,
+    app_data_dir: &Path,
+) -> Vec<String> {
     if let Some(cmd) = &cfg.backend_command {
         if !cmd.is_empty() {
             return cmd.clone();
         }
     }
-    // 1) 本机已安装的 Harness（优先使用本地安装）
+    // 1) 应用管理的后端（首次启动/自动更新生成，跟随最新版本）
+    if let Some(cmd) = managed_backend(app_data_dir, resource_dir, &cfg.harness_url) {
+        return cmd;
+    }
+    // 2) 本机已安装的 Harness（优先使用本地安装）
     if let Some(node) = find_node() {
         if let Some(bin) = find_dsh_bin() {
             return vec![node, bin, "web".into()];
         }
     }
-    // 2) 内置（随应用打包）的官方 Harness
+    // 3) 内置（随应用打包）的官方 Harness
     if let Some(cmd) = bundled_backend(resource_dir, &cfg.harness_url) {
         return cmd;
     }
-    // 3) 兜底：PATH 上的 dsh，或 npx 现场拉取
+    // 4) 兜底：PATH 上的 dsh，或 npx 现场拉取
     #[cfg(windows)]
     let fallback = vec![
         "cmd".into(),
@@ -284,7 +556,8 @@ fn get_config(state: State<'_, AppState>) -> ConfigView {
 fn start_backend(state: State<'_, AppState>) -> Result<BackendStartResult, String> {
     let cfg = state.config.lock().unwrap().clone();
     let resource_dir = state.resource_dir.clone();
-    let cmdline = resolve_backend_command(&cfg, &resource_dir);
+    let app_data_dir = state.app_data_dir.clone();
+    let cmdline = resolve_backend_command(&cfg, &resource_dir, &app_data_dir);
     if cmdline.is_empty() {
         return Err("未配置后端启动命令".into());
     }
@@ -332,8 +605,19 @@ fn start_backend(state: State<'_, AppState>) -> Result<BackendStartResult, Strin
 fn read_backend_log(state: State<'_, AppState>, lines: Option<usize>) -> String {
     let cfg = state.config.lock().unwrap();
     let log_path = exe_dir().join(&cfg.backend_log_file);
+    read_log_tail(&log_path, lines)
+}
+
+/// 读取更新日志尾部（app_data_dir/backend/update.log，启动页展示更新进度用）
+#[tauri::command]
+fn read_update_log(state: State<'_, AppState>, lines: Option<usize>) -> String {
+    let log_path = state.app_data_dir.join("backend").join("update.log");
+    read_log_tail(&log_path, lines)
+}
+
+fn read_log_tail(log_path: &Path, lines: Option<usize>) -> String {
     let n = lines.unwrap_or(40).max(1);
-    match fs::read_to_string(&log_path) {
+    match fs::read_to_string(log_path) {
         Ok(text) => {
             let all: Vec<&str> = text.lines().collect();
             let start = all.len().saturating_sub(n);
@@ -343,10 +627,53 @@ fn read_backend_log(state: State<'_, AppState>, lines: Option<usize>) -> String 
     }
 }
 
+/// 当前后端版本与更新开关（启动页先调用，用于展示与决定是否检查更新）
+#[tauri::command]
+fn get_update_info(state: State<'_, AppState>) -> UpdateInfo {
+    let cfg = state.config.lock().unwrap();
+    let (current_version, current_source) =
+        current_backend_version(&state.app_data_dir, &state.resource_dir);
+    UpdateInfo {
+        check_updates: cfg.check_updates,
+        auto_update: cfg.auto_update,
+        update_timeout_sec: cfg.update_timeout_sec,
+        registry_url: cfg.registry_url.clone(),
+        current_version,
+        current_source: current_source.to_string(),
+    }
+}
+
+/// 联网检查 DeepSeek Harness 是否有新版本（运行 ensure-backend.mjs --check-only）。
+/// 放到阻塞线程池执行，避免阻塞主线程（同步命令会卡 UI）。
+#[tauri::command]
+async fn check_update(state: State<'_, AppState>) -> Result<UpdateCheck, String> {
+    let cfg = state.config.lock().unwrap().clone();
+    let resource_dir = state.resource_dir.clone();
+    let app_data_dir = state.app_data_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        run_update_script(&cfg, &resource_dir, &app_data_dir, true)
+    })
+    .await
+    .map_err(|e| format!("检查更新失败: {e}"))?
+}
+
+/// 安装/更新 DeepSeek Harness 后端到应用数据目录（首次安装或同步到最新版）。
+/// 可能耗时数分钟（下载依赖），同样放到阻塞线程池；进度见 update.log（read_update_log 轮询）。
+#[tauri::command]
+async fn install_update(state: State<'_, AppState>) -> Result<UpdateCheck, String> {
+    let cfg = state.config.lock().unwrap().clone();
+    let resource_dir = state.resource_dir.clone();
+    let app_data_dir = state.app_data_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        run_update_script(&cfg, &resource_dir, &app_data_dir, false)
+    })
+    .await
+    .map_err(|e| format!("安装/更新失败: {e}"))?
+}
+
 /// 启动页调试日志（写入 exe 旁 launcher.log）
 #[tauri::command]
 fn debug_log(text: String) {
-    use std::io::Write;
     let path = exe_dir().join("launcher.log");
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(f, "{}", text);
@@ -397,9 +724,15 @@ pub fn run() {
                 .path()
                 .resource_dir()
                 .unwrap_or_else(|_| exe_dir());
+            // 可写的应用数据目录：自动更新的后端安装于此
+            let app_data_dir = app
+                .path()
+                .app_data_dir()
+                .unwrap_or_else(|_| exe_dir().join("data"));
             app.manage(AppState {
                 config: Mutex::new(load_config()),
                 resource_dir,
+                app_data_dir,
             });
             let win = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                 .title("deeprein")
@@ -418,7 +751,11 @@ pub fn run() {
             debug_log,
             open_harness,
             focus_window,
-            quit_app
+            quit_app,
+            get_update_info,
+            check_update,
+            install_update,
+            read_update_log
         ])
         .run(tauri::generate_context!())
         .expect("Tauri 应用启动失败");
