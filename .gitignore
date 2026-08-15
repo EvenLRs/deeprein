@@ -1,6 +1,9 @@
 # Node
 node_modules/
 
+# README 仅保留本地副本，不入库、不推送（需恢复时再显式调整）
+README.md
+
 # 更新签名私钥（严禁入库；公钥在 src-tauri/tauri.conf.json）
 .signing/
 
