@@ -12,7 +12,7 @@
 //   RESULT <json>  → 最后一行结果：
 //     { ok, checked, current, latest, update_available, updated, error? }
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { delimiter, dirname, join, resolve } from 'node:path';
 
 // ---------- 参数解析 ----------
@@ -126,6 +126,71 @@ function findNpm(node) {
 
 function isScriptPath(p) {
   return p.includes('/') || p.includes('\\') || p.endsWith('.js');
+}
+
+// 按目标平台裁剪 dsh 安装目录（与 scripts/bundle-backend.mjs 的 pruneBackendPlatform 保持同步，
+// 但此处不裁剪内置 Node 发行目录——那是随应用打包的资源，修改会破坏 .app 签名）：
+//  1) node-pty 只保留当前平台 prebuilds（他平台二进制各 28-30MB）
+//  2) node-pty 编译源码（prebuilds 存在时不会走 gyp 编译）
+//  3) 大体积 sourcemap
+function pruneDshInstall(dshDir) {
+  const platform = process.platform; // win32 | darwin
+  const arch = process.arch; // x64 | arm64
+  let removed = 0;
+  const measure = (p) => {
+    try {
+      let total = 0;
+      const walk = (d) => {
+        for (const e of readdirSync(d, { withFileTypes: true })) {
+          const f = join(d, e.name);
+          if (e.isDirectory()) walk(f);
+          else total += statSync(f).size;
+        }
+      };
+      walk(p);
+      return total;
+    } catch {
+      return 0;
+    }
+  };
+  const prune = (p) => {
+    if (!existsSync(p)) return;
+    removed += measure(p);
+    rmSync(p, { recursive: true, force: true });
+  };
+
+  const pty = join(dshDir, 'node_modules', 'node-pty');
+  if (existsSync(pty)) {
+    const pre = join(pty, 'prebuilds');
+    if (existsSync(pre)) {
+      const want = `${platform}-${arch}`;
+      for (const d of readdirSync(pre)) {
+        if (d !== want) prune(join(pre, d));
+      }
+    }
+    prune(join(pty, 'src'));
+    prune(join(pty, 'deps'));
+    prune(join(pty, 'third_party'));
+  }
+
+  const stack = [dshDir];
+  while (stack.length) {
+    const dir = stack.pop();
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      const f = join(dir, e.name);
+      if (e.isDirectory()) stack.push(f);
+      else if (e.name.endsWith('.map')) prune(f);
+    }
+  }
+
+  const mb = (removed / 1024 / 1024).toFixed(1);
+  if (removed > 0) log(`[裁剪] 移除 ${mb} MB 冗余文件（他平台 prebuilds/sourcemap）`);
 }
 
 function runNpm(node, npmCli, argsArr, cwd) {
@@ -244,6 +309,9 @@ async function main() {
     runNpm(nodeExe, npmCli, ['approve-scripts', '--cache', npmCache, '--all'], dshDir);
     runNpm(nodeExe, npmCli, ['rebuild', '--cache', npmCache], dshDir);
   }
+
+  // 安装完成后裁剪他平台/调试类冗余文件
+  pruneDshInstall(dshDir);
 
   // 记录元信息（与打包脚本 bundle-info.json 同构，供诊断）
   writeFileSync(

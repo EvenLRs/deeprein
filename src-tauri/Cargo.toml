@@ -15,14 +15,19 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 # custom-protocol：release 构建必须启用（否则应用按 dev 模式运行，webview 直接加载 devUrl 而非内嵌启动页）
-tauri = { version = "2", features = ["custom-protocol"] }
-# 壳自身在线更新（检查/下载/安装）
-tauri-plugin-updater = "2"
+# 体积优化：关闭默认 features（x11/dbus 仅 Linux、common-controls-v6 用于菜单、compression 为资源压缩、
+# dynamic-acl 为运行时权限），仅保留本应用所需的 wry + custom-protocol
+tauri = { version = "2", default-features = false, features = ["wry", "custom-protocol"] }
+# 壳自身在线更新（检查/下载/安装）；体积优化：不需要 zip 更新包，关闭 zip feature
+tauri-plugin-updater = { version = "2", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [profile.release]
 codegen-units = 1
 lto = true
-opt-level = "s"
+# "z" 比 "s" 更偏体积（速度略降，桌面壳场景无感知）
+opt-level = "z"
 strip = true
+# 体积优化：panic 直接 abort（生成 unwinding 表更小）
+panic = "abort"

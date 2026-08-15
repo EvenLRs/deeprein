@@ -4,11 +4,96 @@
 //   backend/node/node.exe          (Windows) / backend/node/bin/node (macOS)
 //   backend/dsh/node_modules/...   官方 dsh 包及其运行时依赖
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, rmSync, renameSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  rmSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// 按目标平台裁剪内置后端（与 scripts/ensure-backend.mjs 内的同名逻辑保持同步）：
+//  1) node-pty 只保留当前平台的 prebuilds（他平台二进制各 28-30MB，运行时用不到）
+//  2) Node 发行目录的 include/ 头文件（仅 node-gyp 编译原生模块需要；本项目原生依赖均带平台 prebuild）
+//  3) npm 自带的文档目录
+// 注意：node-pty 的 src/deps/third_party 仅在没有 prebuild 时才需要，一并移除；保留 binding.gyp 以兼容 npm rebuild。
+function pruneBackendPlatform(dshDir, nodeDir, platform, arch) {
+  let removed = 0;
+  const measure = (p) => {
+    try {
+      let total = 0;
+      const walk = (d) => {
+        for (const e of readdirSync(d, { withFileTypes: true })) {
+          const f = join(d, e.name);
+          if (e.isDirectory()) walk(f);
+          else total += statSync(f).size;
+        }
+      };
+      walk(p);
+      return total;
+    } catch {
+      return 0;
+    }
+  };
+  const prune = (p) => {
+    if (!existsSync(p)) return 0;
+    const n = measure(p);
+    rmSync(p, { recursive: true, force: true });
+    removed += n;
+    return n;
+  };
+
+  // 1) node-pty 其他平台 prebuilds
+  const ptyPre = join(dshDir, 'node_modules', 'node-pty', 'prebuilds');
+  if (existsSync(ptyPre)) {
+    const want = `${platform}-${arch}`;
+    for (const d of readdirSync(ptyPre)) {
+      if (d !== want) prune(join(ptyPre, d));
+    }
+  }
+  // node-pty 编译源码（prebuilds 存在时不会走 gyp 编译）
+  prune(join(dshDir, 'node_modules', 'node-pty', 'src'));
+  prune(join(dshDir, 'node_modules', 'node-pty', 'deps'));
+  prune(join(dshDir, 'node_modules', 'node-pty', 'third_party'));
+
+  // 2) 大体积 sourcemap（生产运行时不需要）
+  if (existsSync(dshDir)) {
+    const stack = [dshDir];
+    while (stack.length) {
+      const dir = stack.pop();
+      let entries;
+      try {
+        entries = readdirSync(dir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const e of entries) {
+        const f = join(dir, e.name);
+        if (e.isDirectory()) stack.push(f);
+        else if (e.name.endsWith('.map')) prune(f);
+      }
+    }
+  }
+
+  // 3) Node 发行目录:include 头文件 + npm 文档
+  if (nodeDir) {
+    prune(join(nodeDir, 'include'));
+    prune(join(nodeDir, 'lib', 'node_modules', 'npm', 'docs'));
+  }
+
+  const mb = (removed / 1024 / 1024).toFixed(1);
+  console.log(`[裁剪] 目标平台 ${platform}-${arch}，移除 ${mb} MB 冗余文件`);
+}
+
 // 官方 @deepseek-ai/dsh 版本解析（不再写死）：
+//   1) 命令行 --version=x.y.z 显式指定（可复现构建）
+//   2) 环境变量 DSH_VERSION
+//   3) 联网获取 npm registry 的最新版本（默认行为，构建时跟随最新版）
+//   4) 网络失败时回退到 FALLBACK_DSH_VERSION
 //   1) 命令行 --version=x.y.z 显式指定（可复现构建）
 //   2) 环境变量 DSH_VERSION
 //   3) 联网获取 npm registry 的最新版本（默认行为，构建时跟随最新版）
@@ -156,6 +241,9 @@ if (!existsSync(dshBin)) {
     runNpm(['rebuild'], { cwd: dshDir });
   }
 }
+
+// 按目标平台裁剪冗余内容（他平台 prebuilds、头文件、sourcemap、文档）
+pruneBackendPlatform(dshDir, nodeDir, platform, arch);
 
 // ---- 3. 元信息 ----
 writeFileSync(
