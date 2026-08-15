@@ -68,12 +68,28 @@ jobs:
         if: matrix.os == 'macos-14'
         run: npm run build -- --target ${{ matrix.target }}
 
-      - name: Upload bundle
+      # 上传产物。
+      # 注意:不上传裸 .app 目录——upload-artifact 会丢弃其中的点文件(.github/.yarn/.bin 等),
+      # 破坏 .app 的代码签名封印,解压后系统判「已损坏」(图标问号、双击无反应)。
+      # 用户分发走 dmg 与 .app.tar.gz(单文件,字节完整,签名不受影响)。
+      - name: Upload bundle (Windows)
+        if: matrix.os == 'windows-latest'
         uses: actions/upload-artifact@v4
         with:
           name: deeprein-${{ matrix.label }}
           path: |
-            src-tauri/target/${{ matrix.target }}/release/bundle/**/*
+            src-tauri/target/${{ matrix.target }}/release/bundle/nsis/**/*
+          if-no-files-found: error
+
+      - name: Upload bundle (macOS)
+        if: matrix.os == 'macos-14'
+        uses: actions/upload-artifact@v4
+        with:
+          name: deeprein-${{ matrix.label }}
+          path: |
+            src-tauri/target/${{ matrix.target }}/release/bundle/dmg/**/*
+            src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.tar.gz
+            src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.tar.gz.sig
           if-no-files-found: error
 
   release:
@@ -116,7 +132,13 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           name: DeepRein ${{ github.ref_name }}
-          body: 自动发布：DeepRein ${{ github.ref_name }}（含在线更新包与 latest.json）
+          body: |
+            自动发布：DeepRein ${{ github.ref_name }}（含在线更新包与 latest.json）
+
+            **macOS 安装说明**：下载 `.dmg` 挂载后把 DeepRein.app 拖入「应用程序」，首次打开前在终端执行（解除下载隔离）：
+            ```
+            xattr -cr /Applications/DeepRein.app
+            ```
           files: |
             latest.json
             artifacts/**/*
