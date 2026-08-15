@@ -5,8 +5,10 @@
 //   backend/dsh/node_modules/...   官方 dsh 包及其运行时依赖
 import { spawnSync } from 'node:child_process';
 import {
+  copyFileSync,
   existsSync,
   mkdirSync,
+  readFileSync,
   readdirSync,
   rmSync,
   renameSync,
@@ -249,12 +251,123 @@ if (!existsSync(dshBin)) {
 // 按目标平台裁剪冗余内容（他平台 prebuilds、头文件、sourcemap、文档）
 pruneBackendPlatform(dshDir, nodeDir, platform, arch);
 
-// ---- 3. 元信息 ----
+// ---- 3. 第三方 Harness 插件（随壳打包；运行时由 ensure-plugin.mjs 装入 web profile） ----
+const pluginDir = join(backend, 'plugin');
+mkdirSync(pluginDir, { recursive: true });
+const pluginManifest = [];
+// 清理上一轮打包的 tarball，避免版本变化后旧产物残留进 manifest/壳资源
+for (const file of readdirSync(pluginDir)) {
+  if (file.endsWith('.tgz')) rmSync(join(pluginDir, file), { force: true });
+}
+
+// dsh-messaging 动态插件的源码与伴随脚本先同步进启动壳包（单一事实来源在 .dsh-messaging/）。
+// CI 无 .dsh-messaging 时使用已入库的 plugins/dsh-messaging 拷贝。
+{
+  const messagingSrc = join(root, '.dsh-messaging');
+  const messagingPkg = join(root, 'plugins', 'dsh-messaging');
+  const syncFiles = [
+    ['dynamic', 'host.js'],
+    ['dynamic', 'client.js'],
+    ['dynamic', 'manifest.json'],
+    ['companion', 'crypto-helper.cjs'],
+    ['companion', 'discord-gateway.cjs'],
+    ['', 'config.example.json'],
+  ];
+  for (const [relDir, file] of syncFiles) {
+    const src = join(messagingSrc, relDir, file);
+    if (!existsSync(src)) continue;
+    const dst = join(messagingPkg, relDir, file);
+    mkdirSync(join(messagingPkg, relDir), { recursive: true });
+    copyFileSync(src, dst);
+  }
+}
+
+// 当前 dsh web profile 实际引用的插件清单（与 README 中的记录保持一致）：
+//   - 本地 fork 优先（本机当前安装的就是它）；CI 无该目录时回退到 npm 发布版
+const bundledPlugins = [
+  {
+    name: '@zebbkira/dsh-skills-mcp-manager',
+    local: join(root, 'plugins', 'dsh-skills-mcp-manager'),
+    fallback: '@zebbkira/dsh-skills-mcp-manager@0.1.3',
+  },
+  { name: 'dsh-better-sidebar', spec: 'dsh-better-sidebar@0.12.1' },
+  { name: 'dsh-browser', spec: 'dsh-browser@0.1.0' },
+  { name: 'dsh-mnemon', spec: 'dsh-mnemon@0.1.4' },
+  { name: 'dshmarket', spec: 'dshmarket@1.5.0' },
+  // dsh-messaging 启动壳：随 DeepRein 分发，自动注册/激活消息网关动态插件
+  { name: '@deeprein/dsh-messaging', local: join(root, 'plugins', 'dsh-messaging') },
+];
+
+for (const p of bundledPlugins) {
+  let spec = p.spec ?? null;
+  let version = spec ? spec.split('@').pop() : null;
+  if (p.local) {
+    const pkgPath = join(p.local, 'package.json');
+    if (existsSync(pkgPath)) {
+      spec = p.local;
+      try {
+        version = JSON.parse(readFileSync(pkgPath, 'utf8')).version;
+      } catch {
+        version = null;
+      }
+    } else {
+      console.warn(`[警告] 本地插件目录缺失 ${p.local}，回退到 registry ${p.fallback}`);
+      spec = p.fallback;
+      version = p.fallback.split('@').pop();
+    }
+  }
+  if (!spec) throw new Error(`插件 ${p.name} 既无本地目录也无 registry 回退，无法打包`);
+  console.log(`[插件] 打包 ${spec}`);
+  runNpm(['pack', spec, '--pack-destination', pluginDir]);
+  // 预期产物名：<scope 去 @ 并把 / 换成 ->-<version>.tgz（与 npm pack 一致）
+  const prefix = p.name.replace(/^@/, '').replace('/', '-');
+  const tarball =
+    readdirSync(pluginDir).find((f) => f === `${prefix}-${version}.tgz`) ??
+    readdirSync(pluginDir).find((f) => f.endsWith('.tgz') && f.startsWith(`${prefix}-`));
+  if (!tarball) throw new Error(`未找到插件 ${p.name} 的打包产物（${spec}）`);
+  console.log(`[插件] ${p.name}@${version ?? '?'} → ${tarball}`);
+  pluginManifest.push({ name: p.name, version, tarball });
+}
+
+// ---- 4. pnpm 运行时（安装插件用；随壳分发，不依赖目标机 PATH） ----
+const pnpmCli = join(backend, 'tools', 'node_modules', 'pnpm', 'bin', 'pnpm.cjs');
+if (!existsSync(pnpmCli)) {
+  console.log('[工具] 安装 pnpm（运行时插件安装器）');
+  runNpm([
+    'install',
+    '--prefix',
+    join(backend, 'tools'),
+    'pnpm@11',
+    '--omit=dev',
+    '--no-audit',
+    '--no-fund',
+    '--no-package-lock',
+  ]);
+}
+
+// ---- 5. 元信息 ----
+writeFileSync(
+  join(pluginDir, 'manifest.json'),
+  JSON.stringify(
+    {
+      generated_at: new Date().toISOString(),
+      pnpm: 'tools/node_modules/pnpm/bin/pnpm.cjs',
+      plugins: pluginManifest,
+    },
+    null,
+    2,
+  ),
+);
 writeFileSync(
   join(backend, 'bundle-info.json'),
-  JSON.stringify({ dsh: dshVersion, node: NODE_VERSION, platform, arch }, null, 2),
+  JSON.stringify(
+    { dsh: dshVersion, node: NODE_VERSION, platform, arch, plugins: pluginManifest },
+    null,
+    2,
+  ),
 );
 
 console.log('[OK] 后端已打包');
 console.log('  node:', nodeExe);
 console.log('  dsh :', dshBin);
+console.log('  插件:', join(pluginDir, 'manifest.json'));

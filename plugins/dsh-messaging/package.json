@@ -1,0 +1,23 @@
+{
+  "name": "@deeprein/dsh-messaging",
+  "version": "0.1.1",
+  "private": true,
+  "description": "DeepRein 内置消息网关启动壳：自动注册并激活 dsh-messaging 动态 Cordis 插件",
+  "type": "module",
+  "main": "lib/index.js",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "lib",
+    "dynamic",
+    "companion",
+    "config.example.json",
+    "cordis.patch.yml"
+  ]
+}

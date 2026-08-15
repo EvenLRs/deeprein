@@ -20,6 +20,9 @@ const DEFAULT_REGISTRY_URL: &str = "https://registry.npmjs.org/@deepseek-ai/dsh"
 /// 运行时安装/更新后端脚本（scripts/ensure-backend.mjs），随二进制内嵌，无需额外资源文件
 const ENSURE_BACKEND_JS: &str = include_str!("../../scripts/ensure-backend.mjs");
 
+/// 运行时把随壳打包的 Harness 插件装入 web profile 的脚本（scripts/ensure-plugin.mjs）
+const ENSURE_PLUGIN_JS: &str = include_str!("../../scripts/ensure-plugin.mjs");
+
 /// 客户端配置（读取 exe 旁的 config.json；缺省用内置默认值）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -162,6 +165,29 @@ impl Default for UpdateCheck {
             latest: None,
             update_available: false,
             updated: false,
+            error: None,
+        }
+    }
+}
+
+/// Harness 插件安装结果（与 ensure-plugin.mjs 的 RESULT 行同构）
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct PluginEnsureResult {
+    ok: bool,
+    /// web profile 尚不存在（后端还没首启），需要延后到后端就绪后重试
+    profile_missing: bool,
+    /// 本次是否真的新装/更新了插件（true 表示后端需重启生效）
+    installed: bool,
+    error: Option<String>,
+}
+
+impl Default for PluginEnsureResult {
+    fn default() -> Self {
+        Self {
+            ok: true,
+            profile_missing: false,
+            installed: false,
             error: None,
         }
     }
@@ -366,6 +392,28 @@ fn find_update_node(resource_dir: &Path) -> Option<String> {
     find_node()
 }
 
+/// 随应用分发的 pnpm 入口（bundled 为 tools/node_modules/pnpm/bin/pnpm.cjs，由 bundle-backend.mjs 安装）
+fn bundled_pnpm(resource_dir: &Path) -> Option<String> {
+    for root in bundled_roots(resource_dir) {
+        let cli = root.join("tools").join("node_modules").join("pnpm").join("bin").join("pnpm.cjs");
+        if cli.exists() {
+            return Some(normalize_path(&cli.to_string_lossy()));
+        }
+    }
+    None
+}
+
+/// 随应用分发的插件清单（bundled 为 backend/plugin/manifest.json）
+fn bundled_plugin_manifest(resource_dir: &Path) -> Option<PathBuf> {
+    for root in bundled_roots(resource_dir) {
+        let manifest = root.join("plugin").join("manifest.json");
+        if manifest.exists() {
+            return Some(manifest);
+        }
+    }
+    None
+}
+
 /// 当前可用的后端版本与来源：应用管理目录 → 内置 → 本机安装 → 无
 fn current_backend_version(
     app_data_dir: &Path,
@@ -505,6 +553,112 @@ fn run_update_script(
             format!("更新脚本未返回结果，详情见 {}", log_path.display())
         }),
         ..UpdateCheck::default()
+    })
+}
+
+/// 运行 ensure-plugin.mjs（内嵌脚本），把随壳打包的插件安装进 dsh web profile。
+/// profile 尚不存在时返回 profile_missing=true（由调用方在后端首启后再跑一次）。
+fn run_plugin_script(
+    cfg: &ClientConfig,
+    resource_dir: &Path,
+    app_data_dir: &Path,
+    home_dir: &Path,
+) -> Result<PluginEnsureResult, String> {
+    // 旧包/开发态没有插件资源时静默跳过（nothing to do）
+    let manifest = match bundled_plugin_manifest(resource_dir) {
+        Some(m) => m,
+        None => return Ok(PluginEnsureResult::default()),
+    };
+    let pnpm = bundled_pnpm(resource_dir)
+        .ok_or_else(|| "未找到随包分发的 pnpm 运行时，无法安装 Harness 插件".to_string())?;
+    let node = find_update_node(resource_dir).ok_or_else(|| {
+        "未找到可用的 Node 运行时（内置 backend/node 或本机 node），无法安装 Harness 插件"
+            .to_string()
+    })?;
+
+    let target = app_data_dir.join("plugin");
+    fs::create_dir_all(&target)
+        .map_err(|e| format!("无法创建插件数据目录 {}: {e}", target.display()))?;
+    let script_path = target.join("ensure-plugin.mjs");
+    fs::write(&script_path, ENSURE_PLUGIN_JS)
+        .map_err(|e| format!("无法写入插件安装脚本 {}: {e}", script_path.display()))?;
+
+    let log_path = target.join("plugin.log");
+    let log_file = fs::File::create(&log_path)
+        .map_err(|e| format!("无法创建插件安装日志 {}: {e}", log_path.display()))?;
+    let stderr_log = log_file
+        .try_clone()
+        .map_err(|e| format!("插件安装日志句柄错误: {e}"))?;
+
+    let profile = home_dir.join(".dsh").join("profiles").join("web");
+    let mut cmd_args = vec![
+        normalize_path(&script_path.to_string_lossy()),
+        "--profile".into(),
+        normalize_path(&profile.to_string_lossy()),
+        "--manifest".into(),
+        normalize_path(&manifest.to_string_lossy()),
+        "--pnpm".into(),
+        pnpm,
+        "--node".into(),
+        node.clone(),
+        "--target".into(),
+        normalize_path(&target.to_string_lossy()),
+    ];
+    let mut child = Command::new(&node)
+        .args(&mut cmd_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(stderr_log))
+        .spawn()
+        .map_err(|e| format!("无法启动插件安装脚本 [{node}]: {e}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "无法读取插件安装脚本输出".to_string())?;
+    let child_mut = Arc::new(Mutex::new(child));
+
+    // 超时看护：首次安装需要 pnpm 拉取插件依赖，可能耗时数分钟
+    let timeout = Duration::from_secs(cfg.update_timeout_sec.max(30));
+    {
+        let watched = child_mut.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(timeout);
+            let _ = watched.lock().unwrap().kill();
+        });
+    }
+
+    let mut log_writer = log_file;
+    let mut result_line: Option<String> = None;
+    for line in BufReader::new(stdout).lines() {
+        match line {
+            Ok(l) => {
+                let _ = writeln!(log_writer, "{l}");
+                if let Some(payload) = l.strip_prefix("RESULT ") {
+                    result_line = Some(payload.to_string());
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let status = child_mut
+        .lock()
+        .unwrap()
+        .wait()
+        .map_err(|e| format!("等待插件安装脚本退出失败: {e}"))?;
+
+    if let Some(json) = result_line {
+        return serde_json::from_str(&json)
+            .map_err(|e| format!("插件安装脚本返回异常 [{json}]: {e}"));
+    }
+    Err(if !status.success() {
+        format!(
+            "插件安装超时或失败（{} 秒），详情见 {}",
+            timeout.as_secs(),
+            log_path.display()
+        )
+    } else {
+        format!("插件安装脚本未返回结果，详情见 {}", log_path.display())
     })
 }
 
@@ -824,6 +978,26 @@ async fn install_update(state: State<'_, AppState>) -> Result<UpdateCheck, Strin
     .map_err(|e| format!("安装/更新失败: {e}"))?
 }
 
+/// 把随壳打包的 Harness 插件安装进 dsh web profile（阻塞线程池执行，可能耗时数分钟）
+#[tauri::command]
+async fn ensure_plugins(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<PluginEnsureResult, String> {
+    let cfg = state.config.lock().unwrap().clone();
+    let resource_dir = state.resource_dir.clone();
+    let app_data_dir = state.app_data_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let home = app
+            .path()
+            .home_dir()
+            .map_err(|e| format!("无法定位用户目录: {e}"))?;
+        run_plugin_script(&cfg, &resource_dir, &app_data_dir, &home)
+    })
+    .await
+    .map_err(|e| format!("插件安装失败: {e}"))?
+}
+
 /// 检查 DeepRein 壳自身的更新（tauri-plugin-updater）。
 /// 返回 None 表示已是最新版本或端点不可用。
 #[tauri::command]
@@ -921,6 +1095,29 @@ fn debug_log(text: String) {
 #[tauri::command]
 fn open_harness(window: WebviewWindow, state: State<'_, AppState>) -> Result<(), String> {
     let cfg = state.config.lock().unwrap().clone();
+    // 进入 Harness 前先把随壳打包的插件装入 web profile；本次若新装了插件，
+    // 重启后端进程使其生效并等待重新就绪（后端不是本客户端启动的则下次启动生效）。
+    let home = window
+        .app_handle()
+        .path()
+        .home_dir()
+        .map_err(|e| format!("无法定位用户目录: {e}"))?;
+    match run_plugin_script(&cfg, &state.resource_dir, &state.app_data_dir, &home) {
+        Ok(ensure) if ensure.installed => {
+            if let Some(pid) = *state.backend_pid.lock().unwrap() {
+                kill_backend_process(pid);
+                let restarted =
+                    spawn_backend_impl(&cfg, &state.resource_dir, &state.app_data_dir)?;
+                *state.backend_pid.lock().unwrap() = restarted.pid;
+            }
+            let deadline = Instant::now() + Duration::from_secs(cfg.start_timeout_sec.max(10));
+            while Instant::now() < deadline && !backend_reachable(&cfg.harness_url) {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+        Ok(_) => {}
+        Err(e) => rust_log(&format!("open_harness: 插件安装未完成，继续打开: {e}")),
+    }
     navigate_to_harness(&window, &cfg.harness_url)?;
     // 首次进入 Harness 后启动后端状态监测线程（只启动一次）
     if cfg.monitor_backend && !*state.monitor_started.lock().unwrap() {
@@ -1171,7 +1368,8 @@ pub fn run() {
             install_update,
             read_update_log,
             check_app_update,
-            install_app_update
+            install_app_update,
+            ensure_plugins
         ])
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())

@@ -20,7 +20,9 @@
     "createUpdaterArtifacts": true,
     "resources": [
       "../backend/node",
-      "../backend/dsh/node_modules"
+      "../backend/dsh/node_modules",
+      "../backend/plugin",
+      "../backend/tools/node_modules/pnpm"
     ],
     "icon": [
       "icons/32x32.png",
