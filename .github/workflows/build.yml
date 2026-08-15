@@ -107,7 +107,7 @@ jobs:
           node scripts/make-latest-json.mjs \
             --version "${{ steps.version.outputs.version }}" \
             --tag "${{ github.ref_name }}" \
-            --notes "deeprein ${{ github.ref_name }}：${{ github.event.head_commit.message }}" \
+            --notes "DeepRein ${{ github.ref_name }}：${{ github.event.head_commit.message }}" \
             --scan artifacts \
             --out latest.json
 
@@ -115,8 +115,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: deeprein ${{ github.ref_name }}
-          body: 自动发布：deeprein ${{ github.ref_name }}（含在线更新包与 latest.json）
+          name: DeepRein ${{ github.ref_name }}
+          body: 自动发布：DeepRein ${{ github.ref_name }}（含在线更新包与 latest.json）
           files: |
             latest.json
             artifacts/**/*

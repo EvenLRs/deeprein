@@ -2,7 +2,7 @@
   "name": "deeprein",
   "private": true,
   "version": "0.0.1",
-  "description": "deeprein 桌面客户端：把 DeepSeek Harness Web GUI 包装成桌面应用",
+  "description": "DeepRein 桌面客户端：把 DeepSeek Harness Web GUI 包装成桌面应用",
   "type": "module",
   "scripts": {
     "dev": "tauri dev",

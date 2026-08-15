@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "deeprein",
+  "productName": "DeepRein",
   "version": "0.0.1",
   "identifier": "com.deeprein.client",
   "build": {

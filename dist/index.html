@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>deeprein 桌面客户端</title>
+  <title>DeepRein 桌面客户端</title>
   <style>
     :root { color-scheme: dark; }
     * { box-sizing: border-box; }
@@ -94,7 +94,7 @@
 <body>
   <div class="card">
     <div class="logo">DR</div>
-    <h1>deeprein</h1>
+    <h1>DeepRein</h1>
     <p class="sub">桌面客户端</p>
 
     <div id="status" class="status">
@@ -376,7 +376,7 @@
       tick();
     }
 
-    // ---------- deeprein 壳自身在线更新 ----------
+    // ---------- DeepRein 壳自身在线更新 ----------
 
     async function doAppInstall() {
       let unlisten = null;
@@ -385,10 +385,10 @@
           unlisten = await window.__TAURI__.event.listen('app-update-progress', (ev) => {
             const p = ev.payload || {};
             const pct = p.total ? Math.round((p.chunk / p.total) * 100) + '%' : '';
-            setStatus('正在下载 deeprein 更新…', false, pct);
+            setStatus('正在下载 DeepRein 更新…', false, pct);
           });
         }
-        setStatus('正在下载 deeprein 更新…', false, '0%');
+        setStatus('正在下载 DeepRein 更新…', false, '0%');
         await tauri().invoke('install_app_update');
         await log('doAppInstall(): install_app_update 完成');
         setStatus('更新已安装，正在重启应用…', true);
@@ -405,7 +405,7 @@
     async function runAppUpdateFlow() {
       if (!cfg.check_app_updates) return;
       try {
-        setStatus('正在检查 deeprein 更新…');
+        setStatus('正在检查 DeepRein 更新…');
         const info = await tauri().invoke('check_app_update');
         await log('app-update: check_app_update ' + JSON.stringify(info));
         if (!info) {
@@ -413,7 +413,7 @@
           return; // 无更新
         }
         setStatus(
-          '发现 deeprein 新版本 v' + info.version + '（当前 v' + info.current_version + '）',
+          '发现 DeepRein 新版本 v' + info.version + '（当前 v' + info.current_version + '）',
           true,
           info.body ? info.body.replace(/\n+/g, ' ') : ''
         );
@@ -443,7 +443,7 @@
       $('update-skip').classList.add('hidden');
       if (pendingAppUpdateChoice) {
         pendingAppUpdateChoice = false;
-        setStatus('已跳过 deeprein 更新，继续启动…');
+        setStatus('已跳过 DeepRein 更新，继续启动…');
         // 继续后续流程（Harness 更新检查 → 主流程）
         runUpdateFlow().then(() => {
           if (!pendingUpdateChoice) startMain();

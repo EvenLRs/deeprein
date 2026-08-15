@@ -45,7 +45,7 @@ struct ClientConfig {
     update_timeout_sec: u64,
     /// npm registry 上 dsh 包的地址（版本查询用）
     registry_url: String,
-    /// 每次启动时检查 deeprein 壳自身的更新
+    /// 每次启动时检查 DeepRein 壳自身的更新
     check_app_updates: bool,
 }
 
@@ -119,7 +119,7 @@ struct UpdateCheck {
     error: Option<String>,
 }
 
-/// deeprein 壳自身的可用更新信息（tauri-plugin-updater 检查结果）
+/// DeepRein 壳自身的可用更新信息（tauri-plugin-updater 检查结果）
 #[derive(Debug, Serialize)]
 struct AppUpdateInfo {
     version: String,
@@ -686,7 +686,7 @@ async fn install_update(state: State<'_, AppState>) -> Result<UpdateCheck, Strin
     .map_err(|e| format!("安装/更新失败: {e}"))?
 }
 
-/// 检查 deeprein 壳自身的更新（tauri-plugin-updater）。
+/// 检查 DeepRein 壳自身的更新（tauri-plugin-updater）。
 /// 返回 None 表示已是最新版本或端点不可用。
 #[tauri::command]
 async fn check_app_update(app: AppHandle) -> Result<Option<AppUpdateInfo>, String> {
@@ -700,7 +700,7 @@ async fn check_app_update(app: AppHandle) -> Result<Option<AppUpdateInfo>, Strin
     }))
 }
 
-/// 下载并安装 deeprein 壳更新。
+/// 下载并安装 DeepRein 壳更新。
 /// 下载进度通过 app-update-progress 事件发给启动页；
 /// macOS：安装完成后自动重启加载新版本；Windows(NSIS)：安装器接管后退出本进程。
 #[tauri::command]
@@ -809,7 +809,7 @@ pub fn run() {
                 app_data_dir,
             });
             let win = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-                .title("deeprein")
+                .title("DeepRein")
                 .inner_size(1280.0, 860.0)
                 .min_inner_size(960.0, 640.0)
                 .center()
