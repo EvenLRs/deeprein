@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -88,6 +88,17 @@ struct AppState {
     backend_pid: Arc<Mutex<Option<u32>>>,
     /// 后端状态监测线程是否已启动（防止重复启动）
     monitor_started: Arc<Mutex<bool>>,
+    /// 最近一次后端健康探测结果（窗口标题 / 状态事件展示用）
+    backend_health: Mutex<BackendHealth>,
+}
+
+/// 后端健康状态三态：在线（HTTP 2xx）/ 异常（端口通但服务不正常）/ 离线（连不上）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum BackendHealth {
+    Online,
+    Degraded,
+    Offline,
 }
 
 #[derive(Serialize)]
@@ -564,10 +575,75 @@ fn backend_reachable(url_str: &str) -> bool {
     false
 }
 
+/// 后端健康探测：HTTP GET 根路径，按响应区分三态。
+/// 仅 TCP 连接会把「端口通但服务已坏」（如进程僵尸、对所有请求回 400）误判为在线，
+/// 因此必须读到合法 HTTP 状态行，且 2xx 才算在线。
+fn check_backend_health(url_str: &str) -> BackendHealth {
+    let url = match url_str.parse::<tauri::Url>() {
+        Ok(u) => u,
+        Err(_) => return BackendHealth::Offline,
+    };
+    let host = match url.host_str() {
+        Some(h) => h.to_string(),
+        None => return BackendHealth::Offline,
+    };
+    let port = url.port_or_known_default().unwrap_or(80);
+    let path = if url.path().is_empty() { "/" } else { url.path() };
+    let addrs = match (host.as_str(), port).to_socket_addrs() {
+        Ok(a) => a,
+        Err(_) => return BackendHealth::Offline,
+    };
+
+    for addr in addrs {
+        let mut stream = match std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+        let host_header = if host.contains(':') {
+            format!("[{host}]:{port}")
+        } else if port == 80 {
+            host.clone()
+        } else {
+            format!("{host}:{port}")
+        };
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\nAccept: */*\r\n\r\n"
+        );
+        if stream.write_all(request.as_bytes()).is_err() {
+            return BackendHealth::Degraded; // 端口通但写不进去 → 服务异常
+        }
+        // 只读状态行（最多 512 字节），不关心响应体
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            match stream.read(&mut byte) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    head.push(byte[0]);
+                    if byte[0] == b'\n' || head.len() >= 512 {
+                        break;
+                    }
+                }
+            }
+        }
+        let line = String::from_utf8_lossy(&head);
+        let mut parts = line.split_whitespace();
+        let _version = parts.next();
+        return match parts.next().and_then(|code| code.parse::<u16>().ok()) {
+            Some(code) if (200..300).contains(&code) => BackendHealth::Online,
+            Some(_) => BackendHealth::Degraded,
+            None => BackendHealth::Degraded, // 端口通但不是合法 HTTP 响应
+        };
+    }
+    BackendHealth::Offline
+}
+
 /// 探测后端是否可达（启动页轮询用）
 #[tauri::command]
 fn check_backend(state: State<'_, AppState>) -> bool {
-    backend_reachable(&state.config.lock().unwrap().harness_url)
+    check_backend_health(&state.config.lock().unwrap().harness_url) == BackendHealth::Online
 }
 
 /// 读取当前配置（启动页用于决定探测地址与自动启动行为）
@@ -988,6 +1064,41 @@ fn start_backend_monitor(
     });
 }
 
+/// 后端在线状态标题文案
+fn backend_title(health: BackendHealth) -> &'static str {
+    match health {
+        BackendHealth::Online => "DeepRein · 后端在线",
+        BackendHealth::Degraded => "DeepRein · 后端异常",
+        BackendHealth::Offline => "DeepRein · 后端离线",
+    }
+}
+
+/// 后端状态观察线程：定期 HTTP 健康探测，更新窗口标题并广播状态变化事件。
+/// 每轮都重设标题：主窗口导航到 Harness 后页面自身的 <title> 会覆盖窗口标题，
+/// 这里周期性重申，确保标题始终反映后端状态。
+fn start_status_watcher(app: AppHandle, harness_url: String, interval: Duration) {
+    std::thread::spawn(move || {
+        let mut last: Option<BackendHealth> = None;
+        loop {
+            let health = check_backend_health(&harness_url);
+            if last != Some(health) {
+                last = Some(health);
+                if let Some(state) = app.try_state::<AppState>() {
+                    *state.backend_health.lock().unwrap() = health;
+                }
+                let _ = app.emit(
+                    "backend-status-changed",
+                    serde_json::json!({ "status": health }),
+                );
+            }
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.set_title(backend_title(health));
+            }
+            std::thread::sleep(interval);
+        }
+    });
+}
+
 /// 主动恢复并聚焦主窗口（启动页可在需要时调用）
 #[tauri::command]
 fn focus_window(window: WebviewWindow) {
@@ -1025,6 +1136,7 @@ pub fn run() {
                 app_data_dir,
                 backend_pid: Arc::new(Mutex::new(None)),
                 monitor_started: Arc::new(Mutex::new(false)),
+                backend_health: Mutex::new(BackendHealth::Offline),
             });
             let win = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                 .title("DeepRein")
@@ -1033,6 +1145,16 @@ pub fn run() {
                 .center()
                 .build()?;
             restore_window(&win);
+            let (harness_url, health_interval) = {
+                let state = app.state::<AppState>();
+                let cfg = state.config.lock().unwrap();
+                (
+                    cfg.harness_url.clone(),
+                    Duration::from_millis(cfg.health_check_interval_ms.max(1000)),
+                )
+            };
+            let _ = win.set_title("DeepRein · 后端检测中…");
+            start_status_watcher(app.handle().clone(), harness_url, health_interval);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

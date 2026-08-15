@@ -186,8 +186,8 @@
     }
 
     // 探测 Harness 是否可达。
-    // 优先走 Rust 侧 TCP 探测：macOS 上 WKWebView 会拦截 tauri:// 自定义协议页面
-    // 向 http 地址发起的跨源 fetch，JS fetch 会一直失败导致卡在"等待服务就绪"。
+    // 优先走 Rust 侧 HTTP 就绪探测（2xx 才算在线，能识别端口通但服务已坏的僵尸进程）：
+    // macOS 上 WKWebView 会拦截 tauri:// 自定义协议页面向 http 地址发起的跨源 fetch。
     async function isReachable() {
       try {
         if (tauri()) {
