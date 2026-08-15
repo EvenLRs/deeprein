@@ -1,4 +1,5 @@
 use std::fs;
+use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -163,42 +164,45 @@ fn normalize_path(s: &str) -> String {
 
 /// 随应用打包的官方 Harness 后端（backend/node + backend/dsh）
 fn bundled_backend(resource_dir: &Path, harness_url: &str) -> Option<Vec<String>> {
+    // 打包器对含 ".." 的资源路径（如 ../backend）会映射为 _up_/backend；
+    // resource_dir() 本身不含 _up_，因此多候选根目录兜底：
+    //  1) resource_dir/_up_/backend   —— tauri 打包后的正式布局（macOS/Windows）
+    //  2) resource_dir/backend        —— 无 ".." 的资源配置或手动放置
+    //  3) exe_dir/backend             —— 开发构建/手动复制到 exe 旁
+    let mut roots = vec![
+        resource_dir.join("_up_").join("backend"),
+        resource_dir.join("backend"),
+        exe_dir().join("backend"),
+    ];
+
     #[cfg(windows)]
-    let node = resource_dir
-        .join("backend")
-        .join("node")
-        .join("node.exe");
+    let node_rel = ["node", "node.exe"].iter().collect::<PathBuf>();
     #[cfg(not(windows))]
-    let node = resource_dir
-        .join("backend")
-        .join("node")
-        .join("bin")
-        .join("node");
-    let bin = resource_dir
-        .join("backend")
-        .join("dsh")
-        .join("node_modules")
-        .join("@deepseek-ai")
-        .join("dsh")
-        .join("lib")
-        .join("bin.js");
-    if node.exists() && bin.exists() {
-        let mut cmd = vec![
-            normalize_path(&node.to_string_lossy()),
-            normalize_path(&bin.to_string_lossy()),
-            "web".into(),
-        ];
-        // 让内置后端服务与 harness_url 相同的端口
-        if let Ok(url) = harness_url.parse::<tauri::Url>() {
-            if let Some(port) = url.port() {
-                cmd.push("--port".into());
-                cmd.push(port.to_string());
+    let node_rel = ["node", "bin", "node"].iter().collect::<PathBuf>();
+    let bin_rel = ["dsh", "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js"]
+        .iter()
+        .collect::<PathBuf>();
+
+    for root in &mut roots {
+        let node = root.join(&node_rel);
+        let bin = root.join(&bin_rel);
+        if node.exists() && bin.exists() {
+            let mut cmd = vec![
+                normalize_path(&node.to_string_lossy()),
+                normalize_path(&bin.to_string_lossy()),
+                "web".into(),
+            ];
+            // 让内置后端服务与 harness_url 相同的端口
+            if let Ok(url) = harness_url.parse::<tauri::Url>() {
+                if let Some(port) = url.port() {
+                    cmd.push("--port".into());
+                    cmd.push(port.to_string());
+                }
             }
+            return Some(cmd);
         }
-        Some(cmd)
-    } else {
-        None
     }
+    None
 }
 
 /// 解析最终的后端启动命令：
@@ -233,6 +237,33 @@ fn resolve_backend_command(cfg: &ClientConfig, resource_dir: &Path) -> Vec<Strin
         "dsh web || npx -y @deepseek-ai/dsh web".into(),
     ];
     fallback
+}
+
+/// 探测后端是否可达（Rust 侧 TCP 连接探测）。
+/// 不能依赖启动页 JS 的 fetch：macOS 上 WKWebView 会拦截自定义协议页面
+/// （tauri://localhost）向 http 地址发起的跨源请求。
+#[tauri::command]
+fn check_backend(state: State<'_, AppState>) -> bool {
+    let url_str = state.config.lock().unwrap().harness_url.clone();
+    let url = match url_str.parse::<tauri::Url>() {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    let host = match url.host_str() {
+        Some(h) => h.to_string(),
+        None => return false,
+    };
+    let port = url.port_or_known_default().unwrap_or(80);
+    let addrs = match (host.as_str(), port).to_socket_addrs() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    for addr in addrs {
+        if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)).is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
 /// 读取当前配置（启动页用于决定探测地址与自动启动行为）
@@ -381,6 +412,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_config,
+            check_backend,
             start_backend,
             read_backend_log,
             debug_log,

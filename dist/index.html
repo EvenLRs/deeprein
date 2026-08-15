@@ -176,9 +176,15 @@
       $('open').classList.remove('hidden');
     }
 
-    // 探测 Harness 是否可达（no-cors 不受 CORS 限制，只判断通/不通）
+    // 探测 Harness 是否可达。
+    // 优先走 Rust 侧 TCP 探测：macOS 上 WKWebView 会拦截 tauri:// 自定义协议页面
+    // 向 http 地址发起的跨源 fetch，JS fetch 会一直失败导致卡在"等待服务就绪"。
     async function isReachable() {
       try {
+        if (tauri()) {
+          return await tauri().invoke('check_backend');
+        }
+        // 普通浏览器预览时的兜底
         await fetch(HARNESS, { mode: 'no-cors', cache: 'no-store' });
         return true;
       } catch {
