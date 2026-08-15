@@ -59,7 +59,13 @@ jobs:
         with:
           workspaces: src-tauri
 
-      - name: Build ${{ matrix.label }}
+      # Windows 收窄为 NSIS：不构建 MSI（减小构建耗时与发布物体积；在线更新与手动安装均用 NSIS）
+      - name: Build ${{ matrix.label }} (Windows, NSIS only)
+        if: matrix.os == 'windows-latest'
+        run: npm run build -- --target ${{ matrix.target }} --bundles nsis
+
+      - name: Build ${{ matrix.label }} (macOS)
+        if: matrix.os == 'macos-14'
         run: npm run build -- --target ${{ matrix.target }}
 
       - name: Upload bundle
