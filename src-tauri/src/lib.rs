@@ -767,6 +767,23 @@ async fn check_app_update(app: AppHandle) -> Result<Option<AppUpdateInfo>, Strin
 /// macOS：安装完成后自动重启加载新版本；Windows(NSIS)：安装器接管后退出本进程。
 #[tauri::command]
 async fn install_app_update(app: AppHandle) -> Result<(), String> {
+    // macOS：应用若从只读 DMG 直接运行，更新替换会失败并可能把应用包留在损坏状态
+    // （图标问号、双击无反应）。下载前先拦截；同时记下包路径，安装完成后解除隔离。
+    #[cfg(target_os = "macos")]
+    let macos_bundle: Option<PathBuf> = {
+        let exe = std::env::current_exe().map_err(|e| format!("无法定位当前应用: {e}"))?;
+        let bundle = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .ok_or_else(|| "无法定位 .app 包路径".to_string())?;
+        if bundle.starts_with("/Volumes/") {
+            return Err(
+                "当前从只读磁盘镜像(DMG)运行，无法原地更新。请先把 DeepRein.app 拖入「应用程序」后再更新。"
+                    .into(),
+            );
+        }
+        Some(bundle.to_path_buf())
+    };
     let updater = app.updater().map_err(|e| format!("updater 初始化失败: {e}"))?;
     let update = updater
         .check()
@@ -798,6 +815,14 @@ async fn install_app_update(app: AppHandle) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         if result.is_ok() {
+            // 更新包经网络下载、解压替换，可能携带隔离属性；解除后再重启，
+            // 避免新版本被 Gatekeeper 判为「已损坏/无法验证」。
+            if let Some(bundle) = macos_bundle {
+                let _ = std::process::Command::new("xattr")
+                    .args(["-cr"])
+                    .arg(&bundle)
+                    .status();
+            }
             if let Ok(exe) = std::env::current_exe() {
                 let _ = std::process::Command::new(exe).spawn();
             }

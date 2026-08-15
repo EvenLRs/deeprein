@@ -135,7 +135,7 @@ jobs:
           body: |
             自动发布：DeepRein ${{ github.ref_name }}（含在线更新包与 latest.json）
 
-            **macOS 安装说明**：下载 `.dmg` 挂载后把 DeepRein.app 拖入「应用程序」，首次打开前在终端执行（解除下载隔离）：
+            **macOS 安装说明**：下载 `.dmg` 挂载后把 DeepRein.app 拖入「应用程序」；也可下载仓库内 `scripts/install-macos.sh` 运行（自动复制到 Applications、解除隔离、刷新问号图标）。若仍提示无法验证，在终端执行：
             ```
             xattr -cr /Applications/DeepRein.app
             ```
