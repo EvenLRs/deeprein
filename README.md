@@ -96,7 +96,10 @@ cargo build --release --target aarch64-apple-darwin
 | macOS arm64 | `macos-14`（Apple Silicon） | `.app` + `.dmg` |
 
 - **推送 `v*` 标签** 或 **手动触发**（Actions 页 → Build Desktop Apps → Run workflow）→ 双平台构建（含内置后端打包），产物上传到 Artifacts（保留 90 天）；**不再自动发布 Release**。
-- 构建无需配置证书；macOS 产物未签名，首次打开需右键 → 打开（或 `xattr -dr com.apple.quarantine`）。
+- macOS 产物为 **ad-hoc 签名**（无需证书即可构建、可运行）；因未用 Apple Developer ID 公证，从网上下载后 Gatekeeper 会拦截一次，首次打开任选其一：
+  1. 右键 `deeprein.app` → **打开** → 再点「打开」；
+  2. 或在终端执行 `xattr -cr /Applications/deeprein.app`（对 dmg：先 `xattr -cr ~/Downloads/deeprein_*.dmg` 再挂载安装）。
+- 想要完全免拦截（双击即开、无任何提示）：需 Apple Developer ID 证书 + 公证，在 CI 配置 `APPLE_CERTIFICATE`/`APPLE_SIGNING_IDENTITY`/`APPLE_ID` 等 secrets 后接入 `tauri-action` 的签名公证流程。
 
 ## 目录结构
 
