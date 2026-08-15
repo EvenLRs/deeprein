@@ -4,10 +4,11 @@ use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_updater::UpdaterExt;
 
 /// 默认 Harness Web GUI 地址
@@ -47,6 +48,12 @@ struct ClientConfig {
     registry_url: String,
     /// 每次启动时检查 DeepRein 壳自身的更新
     check_app_updates: bool,
+    /// 打开 Harness 后是否持续监测后端状态（离线超阈值弹窗提示重启）
+    monitor_backend: bool,
+    /// 后端连续不通多久后弹窗提示（秒，默认 90）
+    backend_down_threshold_sec: u64,
+    /// 后端状态监测间隔（毫秒）
+    health_check_interval_ms: u64,
 }
 
 impl Default for ClientConfig {
@@ -64,6 +71,9 @@ impl Default for ClientConfig {
             update_timeout_sec: 600,
             registry_url: DEFAULT_REGISTRY_URL.to_string(),
             check_app_updates: true,
+            monitor_backend: true,
+            backend_down_threshold_sec: 90,
+            health_check_interval_ms: 5000,
         }
     }
 }
@@ -74,6 +84,10 @@ struct AppState {
     resource_dir: PathBuf,
     /// 应用数据目录（自动更新后的后端存放于此，可写；如 macOS ~/Library/Application Support/com.deeprein.client）
     app_data_dir: PathBuf,
+    /// 由本客户端启动的后端进程 pid（进程组组长；重启后端时先杀旧进程）
+    backend_pid: Arc<Mutex<Option<u32>>>,
+    /// 后端状态监测线程是否已启动（防止重复启动）
+    monitor_started: Arc<Mutex<bool>>,
 }
 
 #[derive(Serialize)]
@@ -525,12 +539,10 @@ fn resolve_backend_command(
     fallback
 }
 
-/// 探测后端是否可达（Rust 侧 TCP 连接探测）。
+/// 后端地址是否可达（TCP 连接探测，2 秒超时）。
 /// 不能依赖启动页 JS 的 fetch：macOS 上 WKWebView 会拦截自定义协议页面
 /// （tauri://localhost）向 http 地址发起的跨源请求。
-#[tauri::command]
-fn check_backend(state: State<'_, AppState>) -> bool {
-    let url_str = state.config.lock().unwrap().harness_url.clone();
+fn backend_reachable(url_str: &str) -> bool {
     let url = match url_str.parse::<tauri::Url>() {
         Ok(u) => u,
         Err(_) => return false,
@@ -550,6 +562,12 @@ fn check_backend(state: State<'_, AppState>) -> bool {
         }
     }
     false
+}
+
+/// 探测后端是否可达（启动页轮询用）
+#[tauri::command]
+fn check_backend(state: State<'_, AppState>) -> bool {
+    backend_reachable(&state.config.lock().unwrap().harness_url)
 }
 
 /// 读取当前配置（启动页用于决定探测地址与自动启动行为）
@@ -572,7 +590,20 @@ fn start_backend(state: State<'_, AppState>) -> Result<BackendStartResult, Strin
     let cfg = state.config.lock().unwrap().clone();
     let resource_dir = state.resource_dir.clone();
     let app_data_dir = state.app_data_dir.clone();
-    let cmdline = resolve_backend_command(&cfg, &resource_dir, &app_data_dir);
+    let result = spawn_backend_impl(&cfg, &resource_dir, &app_data_dir)?;
+    // 记录进程组组长 pid，供后端状态监测重启时先杀旧进程
+    if let Some(pid) = result.pid {
+        *state.backend_pid.lock().unwrap() = Some(pid);
+    }
+    Ok(result)
+}
+
+fn spawn_backend_impl(
+    cfg: &ClientConfig,
+    resource_dir: &Path,
+    app_data_dir: &Path,
+) -> Result<BackendStartResult, String> {
+    let cmdline = resolve_backend_command(cfg, resource_dir, app_data_dir);
     if cmdline.is_empty() {
         return Err("未配置后端启动命令".into());
     }
@@ -613,6 +644,37 @@ fn start_backend(state: State<'_, AppState>) -> Result<BackendStartResult, Strin
         pid: Some(child.id()),
         command: cmdline.join(" "),
     })
+}
+
+/// 杀掉由本客户端启动的后端进程（连同整个进程组/子进程树）
+fn kill_backend_process(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(windows))]
+    {
+        // 后端以新进程组启动，负数 pid 表示杀掉整个进程组
+        let _ = Command::new("kill")
+            .args(["-TERM", &format!("-{pid}")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// Rust 侧调试日志（写入 exe 旁 launcher.log，与启动页 debug_log 同文件）
+fn rust_log(text: &str) {
+    let path = exe_dir().join("launcher.log");
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{}", text);
+    }
 }
 
 /// 读取后端日志尾部（排障用）
@@ -757,19 +819,148 @@ fn debug_log(text: String) {
 /// 让主窗口从启动页导航到 Harness 页面
 #[tauri::command]
 fn open_harness(window: WebviewWindow, state: State<'_, AppState>) -> Result<(), String> {
-    let url_str = state.config.lock().unwrap().harness_url.clone();
+    let cfg = state.config.lock().unwrap().clone();
+    navigate_to_harness(&window, &cfg.harness_url)?;
+    // 首次进入 Harness 后启动后端状态监测线程（只启动一次）
+    if cfg.monitor_backend && !*state.monitor_started.lock().unwrap() {
+        *state.monitor_started.lock().unwrap() = true;
+        start_backend_monitor(
+            window.app_handle().clone(),
+            cfg,
+            state.resource_dir.clone(),
+            state.app_data_dir.clone(),
+            state.backend_pid.clone(),
+        );
+    }
+    Ok(())
+}
+
+/// 导航主窗口到 Harness 页面（抵消 WebView2 初始化/导航时偶发的窗口最小化竞态）
+fn navigate_to_harness(window: &WebviewWindow, url_str: &str) -> Result<(), String> {
     let url: tauri::Url = url_str
         .parse()
         .map_err(|e| format!("无效的 Harness 地址 {url_str}: {e}"))?;
     window.navigate(url).map_err(|e| format!("导航失败: {e}"))?;
-    // 抵消 WebView2 初始化/导航时偶发的窗口最小化竞态
-    restore_window(&window);
+    restore_window(window);
     let win = window.clone();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(1200));
         restore_window(&win);
     });
     Ok(())
+}
+
+/// 后端状态监测：定时 TCP 探测；连续不通超过阈值（默认 90 秒）时弹窗询问是否重启后端。
+/// 用户确认后杀掉旧后端进程组 → 重新启动 → 等待就绪 → 重新打开 Harness 页面。
+fn start_backend_monitor(
+    app: AppHandle,
+    cfg: ClientConfig,
+    resource_dir: PathBuf,
+    app_data_dir: PathBuf,
+    backend_pid: Arc<Mutex<Option<u32>>>,
+) {
+    let interval = Duration::from_millis(cfg.health_check_interval_ms.max(1000));
+    let threshold = Duration::from_secs(cfg.backend_down_threshold_sec.max(10));
+    let harness_url = cfg.harness_url.clone();
+    std::thread::spawn(move || {
+        let mut down_since: Option<Instant> = None;
+        loop {
+            std::thread::sleep(interval);
+            let reachable = backend_reachable(&harness_url);
+            match (reachable, &down_since) {
+                (true, Some(_)) => {
+                    rust_log("monitor: 后端已恢复在线");
+                    down_since = None;
+                }
+                (true, None) => {}
+                (false, None) => {
+                    rust_log("monitor: 后端无响应，开始计时");
+                    down_since = Some(Instant::now());
+                }
+                (false, Some(since)) => {
+                    if since.elapsed() < threshold {
+                        continue;
+                    }
+                    rust_log(&format!(
+                        "monitor: 后端已离线 {} 秒（阈值 {} 秒），弹出重启询问",
+                        since.elapsed().as_secs(),
+                        threshold.as_secs()
+                    ));
+                    // 无论用户如何选择，重置计时避免连续弹窗；稍后再断则重新计满阈值再问
+                    down_since = None;
+                    let confirmed = app
+                        .dialog()
+                        .message(format!(
+                            "DeepSeek Harness 后端已 {} 秒无响应。\n是否重启后端？",
+                            threshold.as_secs()
+                        ))
+                        .title("后端无响应")
+                        .kind(MessageDialogKind::Warning)
+                        .buttons(MessageDialogButtons::OkCancelCustom(
+                            "重启后端".into(),
+                            "稍后再说".into(),
+                        ))
+                        .blocking_show();
+                    if !confirmed {
+                        rust_log("monitor: 用户选择稍后再说");
+                        continue;
+                    }
+                    rust_log("monitor: 用户选择重启后端");
+                    if let Some(pid) = *backend_pid.lock().unwrap() {
+                        rust_log(&format!("monitor: 终止旧后端进程组 pid={pid}"));
+                        kill_backend_process(pid);
+                    }
+                    let restart = spawn_backend_impl(&cfg, &resource_dir, &app_data_dir);
+                    match restart {
+                        Ok(r) => {
+                            if let Some(pid) = r.pid {
+                                *backend_pid.lock().unwrap() = Some(pid);
+                            }
+                            rust_log("monitor: 已重新启动后端，等待就绪…");
+                            let deadline = Instant::now()
+                                + Duration::from_secs(cfg.start_timeout_sec.max(10));
+                            let mut ok = false;
+                            while Instant::now() < deadline {
+                                std::thread::sleep(Duration::from_secs(1));
+                                if backend_reachable(&harness_url) {
+                                    ok = true;
+                                    break;
+                                }
+                            }
+                            if ok {
+                                rust_log("monitor: 重启成功，重新打开 Harness 页面");
+                                if let Some(win) = app.get_webview_window("main") {
+                                    let _ = navigate_to_harness(&win, &harness_url);
+                                }
+                            } else {
+                                rust_log("monitor: 重启后等待就绪超时");
+                                let _ = app
+                                    .dialog()
+                                    .message(format!(
+                                        "后端已重新启动，但 {} 秒内仍未就绪。\n请查看应用旁的 backend.log，或手动在终端运行 dsh web。",
+                                        cfg.start_timeout_sec
+                                    ))
+                                    .title("后端重启未就绪")
+                                    .kind(MessageDialogKind::Error)
+                                    .buttons(MessageDialogButtons::Ok)
+                                    .blocking_show();
+                            }
+                        }
+                        Err(e) => {
+                            rust_log(&format!("monitor: 重启后端失败: {e}"));
+                            let _ = app
+                                .dialog()
+                                .message(format!("重启后端失败：{e}"))
+                                .title("后端重启失败")
+                                .kind(MessageDialogKind::Error)
+                                .buttons(MessageDialogButtons::Ok)
+                                .blocking_show();
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// 主动恢复并聚焦主窗口（启动页可在需要时调用）
@@ -807,6 +998,8 @@ pub fn run() {
                 config: Mutex::new(load_config()),
                 resource_dir,
                 app_data_dir,
+                backend_pid: Arc::new(Mutex::new(None)),
+                monitor_started: Arc::new(Mutex::new(false)),
             });
             let win = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                 .title("DeepRein")
@@ -834,6 +1027,7 @@ pub fn run() {
             install_app_update
         ])
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
         .run(tauri::generate_context!())
         .expect("Tauri 应用启动失败");
 }

@@ -20,6 +20,8 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", default-features = false, features = ["wry", "custom-protocol"] }
 # 壳自身在线更新（检查/下载/安装）；体积优化：不需要 zip 更新包，关闭 zip feature
 tauri-plugin-updater = { version = "2", default-features = false, features = ["rustls-tls"] }
+# 后端离线检测的原生弹窗提示（重启后端确认）
+tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
