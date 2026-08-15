@@ -1,6 +1,9 @@
 # Node
 node_modules/
 
+# 更新签名私钥（严禁入库；公钥在 src-tauri/tauri.conf.json）
+.signing/
+
 # 内置后端（由 scripts/bundle-backend.mjs 生成，不入库）
 backend/
 

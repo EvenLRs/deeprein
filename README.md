@@ -9,6 +9,7 @@
 - 🪟 **原生窗口**：Windows 用 WebView2、macOS 用 WKWebView（系统内核），无捆绑浏览器，安装包小、内存占用低。
 - 🔌 **连接检测 + 自动启动后端**：启动时自动探测 Harness（默认 `127.0.0.1:3080`）；未运行时自动拉起 `dsh web` 后端并等待就绪，失败时给出友好提示与重试。
 - 🔄 **自动检查更新 + 同步最新版**：每次启动先联网查询 npm registry 上 `@deepseek-ai/dsh` 的最新版本；发现新版本会在启动页提醒并自动下载安装到应用数据目录（首次启动若无后端则直接联网获取最新版）。离线或检查失败时静默跳过，不影响启动。
+- 🚀 **壳自身在线更新**：deeprein 桌面应用本身也支持在线更新（Tauri updater 插件 + GitHub Releases 分发）；启动页检查到新版本时提醒用户，点击「立即更新」自动下载安装，macOS 安装后自动重启、Windows 由 NSIS 安装器静默接管。
 - 📦 **内置官方 Harness 后端**：应用自带 Node 运行时 + 官方 `@deepseek-ai/dsh` 包作为离线兜底（打包时跟随 npm 最新版，不再写死版本）——本机已安装则优先用本机，未安装则自动启动内置后端，开箱即用。
 - 🎨 **深色启动页**：原生 UI 质感，检测成功后自动导航进入 Harness。
 - ⚙️ **可配置**：应用旁的 `config.json` 可改地址、启动命令、超时、更新开关等。
@@ -40,7 +41,8 @@
   "check_updates": true,
   "auto_update": true,
   "update_timeout_sec": 600,
-  "registry_url": "https://registry.npmjs.org/@deepseek-ai/dsh"
+  "registry_url": "https://registry.npmjs.org/@deepseek-ai/dsh",
+  "check_app_updates": true
 }
 ```
 
@@ -49,6 +51,16 @@
 ```json
 { "backend_command": ["C:\\Program Files\\nodejs\\node.exe", "C:\\path\\to\\bin.js", "web"] }
 ```
+
+## 壳自身在线更新
+
+deeprein 客户端通过 Tauri 官方 updater 插件支持在线更新，更新包经 GitHub Releases 分发：
+
+- **检查**：每次启动先查询 `https://github.com/EvenLRs/deeprein/releases/latest/download/latest.json`；有新版本时启动页提醒「发现 deeprein 新版本 vX」，点击「立即更新」自动下载安装（`check_app_updates: false` 可关闭）。
+- **安装**：macOS 下载 `.app.tar.gz` 替换应用后自动重启；Windows 由 NSIS 安装器被动模式（`passive`）静默安装。
+- **签名**：更新包用 minisign 密钥对签名，公钥写死在 `src-tauri/tauri.conf.json` 的 `plugins.updater.pubkey`，私钥不入库（本仓库 `.signing/` 已忽略）。CI 需要在仓库 Secrets 里配置两个 secret：`TAURI_SIGNING_PRIVATE_KEY`（`tauri signer generate --password <密码>` 生成的私钥内容）与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`（该密码）；本地打包同理设置这两个环境变量（或 `TAURI_SIGNING_PRIVATE_KEY_PATH`）。
+- **发布流程**：推送 `v*` 标签 → CI 双平台构建并签名 → 自动创建 GitHub Release，`scripts/make-latest-json.mjs` 用 `.sig` 组装 `latest.json` 一并上传；已安装的旧版本客户端下次启动即可检测到更新。
+- **版本升级**：发布新版本前把 `src-tauri/Cargo.toml` 与 `src-tauri/tauri.conf.json` 里的 `version` 同步递增（updater 按版本号比较）。
 
 ## 自动检查更新
 
@@ -112,7 +124,9 @@ cargo build --release --target aarch64-apple-darwin
 | Windows x86_64 | `windows-latest` | NSIS 安装器 `.exe`（+MSI） |
 | macOS arm64 | `macos-14`（Apple Silicon） | `.app` + `.dmg` |
 
-- **推送 `v*` 标签** 或 **手动触发**（Actions 页 → Build Desktop Apps → Run workflow）→ 双平台构建（含内置后端打包），产物上传到 Artifacts（保留 90 天）；**不再自动发布 Release**。
+- **推送 `v*` 标签** 或 **手动触发**（Actions 页 → Build Desktop Apps → Run workflow）→ 双平台构建（含内置后端打包与更新包签名）。
+- **推送 `v*` 标签**时额外执行发布任务：自动创建 GitHub Release，上传安装包 + 在线更新的 `latest.json`（客户端检测更新的数据源）。手动触发仅上传 Artifacts，不发布。
+- 在线更新签名需要仓库 secret `TAURI_SIGNING_PRIVATE_KEY`（见「壳自身在线更新」一节）；缺失时构建无法生成 `.sig`，release 任务会失败。
 - macOS 产物为 **ad-hoc 签名**（无需证书即可构建、可运行）；因未用 Apple Developer ID 公证，从网上下载后 Gatekeeper 会拦截一次，首次打开任选其一：
   1. 右键 `deeprein.app` → **打开** → 再点「打开」；
   2. 或在终端执行 `xattr -cr /Applications/deeprein.app`（对 dmg：先 `xattr -cr ~/Downloads/deeprein_*.dmg` 再挂载安装）。
@@ -138,6 +152,7 @@ deeprein/
 ├── scripts/
 │   ├── bundle-backend.mjs      # 下载 Node 运行时 + 安装官方 dsh（打包前运行；构建时取 npm 最新版）
 │   ├── ensure-backend.mjs      # 运行时后端安装/更新脚本（内嵌进客户端，首次启动安装最新版、日常检查更新）
+│   ├── make-latest-json.mjs    # 从签名产物(.sig)组装 updater 的 latest.json（CI release 任务用）
 │   ├── generate-icons.ps1      # 重新生成图标
 │   └── build.ps1               # 构建辅助脚本
 └── package.json                # 仅供 @tauri-apps/cli 使用

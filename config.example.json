@@ -9,5 +9,6 @@
   "check_updates": true,
   "auto_update": true,
   "update_timeout_sec": 600,
-  "registry_url": "https://registry.npmjs.org/@deepseek-ai/dsh"
+  "registry_url": "https://registry.npmjs.org/@deepseek-ai/dsh",
+  "check_app_updates": true
 }

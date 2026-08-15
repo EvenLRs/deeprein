@@ -17,6 +17,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "resources": [
       "../backend/node",
       "../backend/dsh/node_modules"
@@ -36,6 +37,17 @@
     "macOS": {
       "minimumSystemVersion": "11.0",
       "signingIdentity": "-"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEM3QUM3NjEzQjhDNEY5Q0YKUldUUCtjUzRFM2FzeHd5NlVhQXlsSzNOQkt5MmkzYytPN1h0bGtJN2lOOWgwTStod0xpekFvYXcK",
+      "endpoints": [
+        "https://github.com/EvenLRs/deeprein/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
     }
   }
 }

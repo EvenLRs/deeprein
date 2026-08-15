@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri_plugin_updater::UpdaterExt;
 
 /// 默认 Harness Web GUI 地址
 const DEFAULT_HARNESS_URL: &str = "http://127.0.0.1:3080";
@@ -44,6 +45,8 @@ struct ClientConfig {
     update_timeout_sec: u64,
     /// npm registry 上 dsh 包的地址（版本查询用）
     registry_url: String,
+    /// 每次启动时检查 deeprein 壳自身的更新
+    check_app_updates: bool,
 }
 
 impl Default for ClientConfig {
@@ -60,6 +63,7 @@ impl Default for ClientConfig {
             auto_update: true,
             update_timeout_sec: 600,
             registry_url: DEFAULT_REGISTRY_URL.to_string(),
+            check_app_updates: true,
         }
     }
 }
@@ -79,6 +83,7 @@ struct ConfigView {
     start_timeout_sec: u64,
     start_check_interval_ms: u64,
     backend_command: Option<String>,
+    check_app_updates: bool,
 }
 
 #[derive(Serialize)]
@@ -112,6 +117,15 @@ struct UpdateCheck {
     update_available: bool,
     updated: bool,
     error: Option<String>,
+}
+
+/// deeprein 壳自身的可用更新信息（tauri-plugin-updater 检查结果）
+#[derive(Debug, Serialize)]
+struct AppUpdateInfo {
+    version: String,
+    current_version: String,
+    body: Option<String>,
+    date: Option<String>,
 }
 
 impl Default for UpdateCheck {
@@ -548,6 +562,7 @@ fn get_config(state: State<'_, AppState>) -> ConfigView {
         start_timeout_sec: cfg.start_timeout_sec,
         start_check_interval_ms: cfg.start_check_interval_ms,
         backend_command: cfg.backend_command.as_ref().map(|v| v.join(" ")),
+        check_app_updates: cfg.check_app_updates,
     }
 }
 
@@ -671,6 +686,65 @@ async fn install_update(state: State<'_, AppState>) -> Result<UpdateCheck, Strin
     .map_err(|e| format!("安装/更新失败: {e}"))?
 }
 
+/// 检查 deeprein 壳自身的更新（tauri-plugin-updater）。
+/// 返回 None 表示已是最新版本或端点不可用。
+#[tauri::command]
+async fn check_app_update(app: AppHandle) -> Result<Option<AppUpdateInfo>, String> {
+    let updater = app.updater().map_err(|e| format!("updater 初始化失败: {e}"))?;
+    let update = updater.check().await.map_err(|e| format!("检查更新失败: {e}"))?;
+    Ok(update.map(|u| AppUpdateInfo {
+        version: u.version,
+        current_version: u.current_version,
+        body: u.body,
+        date: u.date.map(|d| d.to_string()),
+    }))
+}
+
+/// 下载并安装 deeprein 壳更新。
+/// 下载进度通过 app-update-progress 事件发给启动页；
+/// macOS：安装完成后自动重启加载新版本；Windows(NSIS)：安装器接管后退出本进程。
+#[tauri::command]
+async fn install_app_update(app: AppHandle) -> Result<(), String> {
+    let updater = app.updater().map_err(|e| format!("updater 初始化失败: {e}"))?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| format!("检查更新失败: {e}"))?
+        .ok_or_else(|| "没有可用的更新".to_string())?;
+
+    let events_progress = app.clone();
+    let events_done = app.clone();
+    let result = update
+        .download_and_install(
+            move |chunk_length, content_length| {
+                let _ = events_progress.emit(
+                    "app-update-progress",
+                    serde_json::json!({ "chunk": chunk_length, "total": content_length }),
+                );
+            },
+            move || {
+                let _ = events_done.emit("app-update-downloaded", ());
+            },
+        )
+        .await
+        .map_err(|e| format!("下载/安装更新失败: {e}"));
+
+    // Windows(NSIS)：安装器已接管，退出本进程；
+    // macOS：插件替换 .app 后需重启进程加载新版本
+    #[cfg(windows)]
+    app.exit(0);
+    #[cfg(target_os = "macos")]
+    {
+        if result.is_ok() {
+            if let Ok(exe) = std::env::current_exe() {
+                let _ = std::process::Command::new(exe).spawn();
+            }
+            app.exit(0);
+        }
+    }
+    result
+}
+
 /// 启动页调试日志（写入 exe 旁 launcher.log）
 #[tauri::command]
 fn debug_log(text: String) {
@@ -755,8 +829,11 @@ pub fn run() {
             get_update_info,
             check_update,
             install_update,
-            read_update_log
+            read_update_log,
+            check_app_update,
+            install_app_update
         ])
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .run(tauri::generate_context!())
         .expect("Tauri 应用启动失败");
 }
