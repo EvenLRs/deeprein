@@ -919,6 +919,93 @@ fn kill_backend_process(pid: u32) {
     }
 }
 
+/// 杀掉外部后端进程（不是本客户端启动的、非进程组组长）：Windows taskkill 整树，
+/// macOS 用普通 kill（外部进程不一定是我们建的进程组，不能加负号）
+fn kill_external_process(pid: u32) {
+    #[cfg(windows)]
+    {
+        let mut cmd = Command::new("taskkill");
+        cmd.args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+        let _ = cmd.status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// 找到监听 harness_url 端口的进程 PID（跨平台：Windows netstat / macOS lsof）
+fn listener_pid(harness_url: &str) -> Option<u32> {
+    let url: tauri::Url = harness_url.parse().ok()?;
+    let port = url.port_or_known_default()?;
+    #[cfg(windows)]
+    {
+        let mut cmd = Command::new("netstat");
+        cmd.arg("-ano")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // 隐藏 netstat 控制台窗口
+        let out = cmd.output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let needle = format!(":{port}");
+        for line in text.lines() {
+            let p: Vec<&str> = line.split_whitespace().collect();
+            if p.len() >= 5
+                && p[0].eq_ignore_ascii_case("tcp")
+                && p[1].ends_with(&needle)
+                && p[3].eq_ignore_ascii_case("listening")
+            {
+                if let Ok(pid) = p[4].parse::<u32>() {
+                    if pid != 0 {
+                        return Some(pid);
+                    }
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        let out = Command::new("lsof")
+            .args(["-ti", &format!("tcp:{port}")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.lines().find_map(|l| l.trim().parse::<u32>().ok())
+    }
+}
+
+/// 插件待生效标记：ensure-plugin 变更过插件（本次安装/版本不一致/bundles reconcile）后
+/// 置为“待重启”，后端重启加载插件成功后清除。标记缺失视为待重启（保守：首启先重启一次，
+/// 确保旧的外部后端也加载到最新插件）。
+fn plugins_pending_flag(app_data_dir: &Path) -> PathBuf {
+    app_data_dir.join("plugin").join("plugins-ready")
+}
+fn plugins_pending(app_data_dir: &Path) -> bool {
+    !plugins_pending_flag(app_data_dir).exists()
+}
+fn mark_plugins_pending(app_data_dir: &Path) {
+    let _ = fs::remove_file(plugins_pending_flag(app_data_dir));
+}
+fn mark_plugins_ready(app_data_dir: &Path) {
+    let _ = fs::write(plugins_pending_flag(app_data_dir), "1");
+}
+
 /// Rust 侧调试日志（写入 exe 旁 launcher.log，与启动页 debug_log 同文件）
 fn rust_log(text: &str) {
     let path = exe_dir().join("launcher.log");
@@ -1115,29 +1202,58 @@ fn debug_log(text: String) {
 #[tauri::command]
 fn open_harness(window: WebviewWindow, state: State<'_, AppState>) -> Result<(), String> {
     let cfg = state.config.lock().unwrap().clone();
-    // 进入 Harness 前先把随壳打包的插件装入 web profile；本次若新装了插件，
-    // 重启后端进程使其生效并等待重新就绪（后端不是本客户端启动的则下次启动生效）。
+    let app_data = state.app_data_dir.clone();
+    let resource_dir = state.resource_dir.clone();
     let home = window
         .app_handle()
         .path()
         .home_dir()
         .map_err(|e| format!("无法定位用户目录: {e}"))?;
-    match run_plugin_script(&cfg, &state.resource_dir, &state.app_data_dir, &home) {
-        Ok(ensure) if ensure.installed => {
-            if let Some(pid) = *state.backend_pid.lock().unwrap() {
-                kill_backend_process(pid);
-                let restarted =
-                    spawn_backend_impl(&cfg, &state.resource_dir, &state.app_data_dir)?;
-                *state.backend_pid.lock().unwrap() = restarted.pid;
+
+    // 1) 进入 Harness 前先把随壳打包的插件同步进 web profile
+    let mut ensure = run_plugin_script(&cfg, &resource_dir, &app_data, &home);
+    if matches!(ensure, Ok(ref e) if e.profile_missing) {
+        // 后端首启中、profile 尚未生成：稍候重试一次
+        std::thread::sleep(Duration::from_secs(3));
+        ensure = run_plugin_script(&cfg, &resource_dir, &app_data, &home);
+    }
+    match ensure {
+        Ok(e) if e.installed => mark_plugins_pending(&app_data),
+        Err(e) => rust_log(&format!("open_harness: 插件同步未完成，继续打开: {e}")),
+        _ => {}
+    }
+
+    // 2) 有待生效的插件变更（本次安装过，或上次安装后后端未被重启过）→ 重启后端加载插件。
+    //    后端不是本客户端启动的外部实例时，先关掉监听端口的旧进程，再由解析器（本机安装优先）拉起。
+    if plugins_pending(&app_data) {
+        let owned = state.backend_pid.lock().unwrap().is_some();
+        let listener = if owned { None } else { listener_pid(&cfg.harness_url) };
+        let restarted = match (owned, listener) {
+            (true, _) => {
+                if let Some(pid) = *state.backend_pid.lock().unwrap() {
+                    kill_backend_process(pid);
+                }
+                spawn_backend_impl(&cfg, &resource_dir, &app_data).ok()
             }
+            (false, Some(pid)) => {
+                kill_external_process(pid);
+                spawn_backend_impl(&cfg, &resource_dir, &app_data).ok()
+            }
+            (false, None) => None, // 无监听者：由启动流程拉起新后端，自然加载插件
+        };
+        if let Some(ref backend) = restarted {
+            *state.backend_pid.lock().unwrap() = backend.pid;
             let deadline = Instant::now() + Duration::from_secs(cfg.start_timeout_sec.max(10));
             while Instant::now() < deadline && !backend_reachable(&cfg.harness_url) {
                 std::thread::sleep(Duration::from_secs(1));
             }
         }
-        Ok(_) => {}
-        Err(e) => rust_log(&format!("open_harness: 插件安装未完成，继续打开: {e}")),
+        // 仅当确实重启/拉起成功后清除待生效标记；失败则保留，下次启动重试
+        if restarted.is_some() || (listener.is_none() && !owned) {
+            mark_plugins_ready(&app_data);
+        }
     }
+
     navigate_to_harness(&window, &cfg.harness_url)?;
     // 首次进入 Harness 后启动后端状态监测线程（只启动一次）
     if cfg.monitor_backend && !*state.monitor_started.lock().unwrap() {
@@ -1145,8 +1261,8 @@ fn open_harness(window: WebviewWindow, state: State<'_, AppState>) -> Result<(),
         start_backend_monitor(
             window.app_handle().clone(),
             cfg,
-            state.resource_dir.clone(),
-            state.app_data_dir.clone(),
+            resource_dir,
+            app_data,
             state.backend_pid.clone(),
         );
     }
