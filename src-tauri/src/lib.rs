@@ -490,11 +490,20 @@ fn run_update_script(
         args.push("--check-only".into());
     }
 
-    let mut child = Command::new(&node)
+    let mut child = Command::new(&node);
+    child
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::from(stderr_log))
+        .stderr(Stdio::from(stderr_log));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW：node 是控制台程序，从无控制台的 GUI 父进程启动时
+        // 若不隐藏会弹出空白 Windows Terminal；CREATE_NEW_PROCESS_GROUP 脱离本客户端
+        child.creation_flags(0x0800_0000 | 0x0000_0200);
+    }
+    let mut child = child
         .spawn()
         .map_err(|e| format!("无法启动更新脚本 [{node}]: {e}"))?;
     let stdout = child
@@ -604,11 +613,19 @@ fn run_plugin_script(
         "--target".into(),
         normalize_path(&target.to_string_lossy()),
     ];
-    let mut child = Command::new(&node)
+    let mut child = Command::new(&node);
+    child
         .args(&mut cmd_args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::from(stderr_log))
+        .stderr(Stdio::from(stderr_log));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // 同更新脚本：隐藏 node 的控制台窗口，避免弹出空白 Terminal
+        child.creation_flags(0x0800_0000 | 0x0000_0200);
+    }
+    let mut child = child
         .spawn()
         .map_err(|e| format!("无法启动插件安装脚本 [{node}]: {e}"))?;
     let stdout = child
@@ -880,12 +897,15 @@ fn spawn_backend_impl(
 fn kill_backend_process(pid: u32) {
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
+        let mut cmd = Command::new("taskkill");
+        cmd.args(["/PID", &pid.to_string(), "/T", "/F"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+            .stderr(Stdio::null());
+        use std::os::windows::process::CommandExt;
+        // taskkill 是控制台程序，同样隐藏窗口避免闪屏
+        cmd.creation_flags(0x0800_0000);
+        let _ = cmd.status();
     }
     #[cfg(not(windows))]
     {
