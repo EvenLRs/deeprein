@@ -55,7 +55,9 @@ const RESTART_BUTTON_JS: &str = r#"
           restore(b, '重启后端');
         }
       } catch (e) {
-        b.textContent = '重启失败';
+        const msg = String((e && e.message) || e).slice(0, 60);
+        b.textContent = '重启失败: ' + msg;
+        try { window.__TAURI_INTERNALS__.invoke('debug_log', { text: 'restart button: ' + msg }); } catch (_) {}
         restore(b, '重启后端');
       }
     });
@@ -892,25 +894,37 @@ fn start_backend(state: State<'_, AppState>) -> Result<BackendStartResult, Strin
 /// 再按解析器（本机安装优先）重新拉起并等待就绪。
 #[tauri::command]
 fn restart_backend(state: State<'_, AppState>) -> Result<BackendStartResult, String> {
-    let cfg = state.config.lock().unwrap().clone();
+    // 互斥锁抗中毒：任何线程先前持锁 panic 都不影响后续重启
+    let cfg = state.config.lock().unwrap_or_else(|p| p.into_inner()).clone();
     let resource_dir = state.resource_dir.clone();
     let app_data_dir = state.app_data_dir.clone();
 
-    let owned = state.backend_pid.lock().unwrap().is_some();
+    let owned = state
+        .backend_pid
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_some();
     let listener = if owned { None } else { listener_pid(&cfg.harness_url) };
     match (owned, listener) {
         (true, _) => {
-            if let Some(pid) = *state.backend_pid.lock().unwrap() {
+            let pid = *state.backend_pid.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(pid) = pid {
                 kill_backend_process(pid);
             }
         }
         (false, Some(pid)) => kill_external_process(pid),
         (false, None) => {}
     }
-    *state.backend_pid.lock().unwrap() = None;
+    *state.backend_pid.lock().unwrap_or_else(|p| p.into_inner()) = None;
 
-    let result = spawn_backend_impl(&cfg, &resource_dir, &app_data_dir)?;
-    *state.backend_pid.lock().unwrap() = result.pid;
+    let result = match spawn_backend_impl(&cfg, &resource_dir, &app_data_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            rust_log(&format!("restart_backend: 重启失败: {e}"));
+            return Err(e);
+        }
+    };
+    *state.backend_pid.lock().unwrap_or_else(|p| p.into_inner()) = result.pid;
 
     let deadline = Instant::now() + Duration::from_secs(cfg.start_timeout_sec.max(10));
     while Instant::now() < deadline && !backend_reachable(&cfg.harness_url) {
@@ -923,13 +937,33 @@ fn spawn_backend_impl(
     cfg: &ClientConfig,
     resource_dir: &Path,
     app_data_dir: &Path,
-) -> Result<BackendStartResult, String> {    let cmdline = resolve_backend_command(cfg, resource_dir, app_data_dir);
+) -> Result<BackendStartResult, String> {
+    let cmdline = resolve_backend_command(cfg, resource_dir, app_data_dir);
     if cmdline.is_empty() {
         return Err("未配置后端启动命令".into());
     }
     let log_path = exe_dir().join(&cfg.backend_log_file);
-    let stdout = fs::File::create(&log_path)
-        .map_err(|e| format!("无法创建后端日志 {}: {e}", log_path.display()))?;
+    // 重启场景：旧后端进程刚被 taskkill，其 stdout/stderr 句柄可能仍短暂占用 backend.log，
+    // 直接 File::create 会报“拒绝访问”。短重试等待句柄释放。
+    let mut stdout = None;
+    for attempt in 0..12 {
+        match fs::File::create(&log_path) {
+            Ok(f) => {
+                stdout = Some(f);
+                break;
+            }
+            Err(e) if attempt < 11 => {
+                rust_log(&format!(
+                    "spawn_backend_impl: 日志文件被占用，重试 ({attempt}/11): {e}"
+                ));
+                std::thread::sleep(Duration::from_millis(400));
+            }
+            Err(e) => {
+                return Err(format!("无法创建后端日志 {}: {e}", log_path.display()));
+            }
+        }
+    }
+    let stdout = stdout.expect("重试循环内必然产出日志文件");
     let stderr = stdout
         .try_clone()
         .map_err(|e| format!("日志文件错误: {e}"))?;
