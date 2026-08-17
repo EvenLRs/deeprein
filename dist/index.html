@@ -117,7 +117,6 @@
       <button id="update-skip" class="hidden">跳过更新</button>
       <button id="retry" class="primary hidden">重试</button>
       <button id="start" class="hidden">启动后端</button>
-      <button id="restart" class="hidden">重启后端</button>
       <button id="open" class="hidden">仍然打开</button>
       <button id="quit">退出</button>
     </div>
@@ -183,7 +182,6 @@
       $('error').classList.remove('hidden');
       $('retry').classList.remove('hidden');
       $('start').classList.remove('hidden');
-      $('restart').classList.remove('hidden');
       $('open').classList.remove('hidden');
     }
 
@@ -460,7 +458,6 @@
       startedBackend = false;
       $('retry').classList.add('hidden');
       $('start').classList.add('hidden');
-      $('restart').classList.add('hidden');
       $('open').classList.add('hidden');
       $('logtail').classList.add('hidden');
       setStatus('正在重新检测…');
@@ -473,21 +470,6 @@
       setStatus('正在启动后端…');
       await doStart();
       timer = setInterval(tick, cfg.start_check_interval_ms);
-    };
-    $('restart').onclick = async () => {
-      $('restart').classList.add('hidden');
-      $('retry').classList.add('hidden');
-      $('start').classList.add('hidden');
-      setStatus('正在重启后端…');
-      try {
-        const r = await tauri().invoke('restart_backend');
-        await log('restart_backend: ' + JSON.stringify(r));
-        const ok = await isReachable();
-        if (ok) { await open(); }
-        else { fail('后端已重启但未就绪', '请查看 backend.log。'); }
-      } catch (e) {
-        fail('重启后端失败：' + (e && e.message ? e.message : e), '请查看 backend.log。');
-      }
     };
     $('open').onclick = () => open(); // 强制打开（服务响应慢或探测被拦截时）
     $('quit').onclick = () => {
