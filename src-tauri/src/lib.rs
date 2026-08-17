@@ -23,6 +23,49 @@ const ENSURE_BACKEND_JS: &str = include_str!("../../scripts/ensure-backend.mjs")
 /// 运行时把随壳打包的 Harness 插件装入 web profile 的脚本（scripts/ensure-plugin.mjs）
 const ENSURE_PLUGIN_JS: &str = include_str!("../../scripts/ensure-plugin.mjs");
 
+/// 注入到 Harness 页面右下角的「重启后端」浮动按钮。
+/// 通过 WebviewWindowBuilder::initialization_script 注入，随主 webview 的每个页面执行；
+/// 仅在 http(s) 页面（Harness GUI）显示，启动页（tauri://）不显示。
+const RESTART_BUTTON_JS: &str = r#"
+(() => {
+  if (!window.location.origin.startsWith('http')) return;
+  const restore = (b, t) => setTimeout(() => { b.disabled = false; b.textContent = t; }, 4000);
+  const mount = () => {
+    const b = document.createElement('button');
+    b.textContent = '重启后端';
+    Object.assign(b.style, {
+      position: 'fixed', right: '12px', bottom: '12px', zIndex: '2147483647',
+      padding: '6px 12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,.22)',
+      background: 'rgba(15,25,45,.82)', color: '#e8eef8', cursor: 'pointer',
+      fontSize: '12px', fontFamily: 'system-ui, -apple-system, sans-serif',
+      boxShadow: '0 2px 10px rgba(0,0,0,.35)', opacity: '.85',
+    });
+    b.onmouseenter = () => { b.style.opacity = '1'; };
+    b.onmouseleave = () => { b.style.opacity = '.85'; };
+    b.addEventListener('click', async () => {
+      b.disabled = true; b.textContent = '重启中…';
+      try {
+        await window.__TAURI_INTERNALS__.invoke('restart_backend');
+        const up = await window.__TAURI_INTERNALS__.invoke('check_backend');
+        if (up) {
+          b.textContent = '已重启，刷新中…';
+          setTimeout(() => window.location.reload(), 800);
+        } else {
+          b.textContent = '重启完成但未就绪';
+          restore(b, '重启后端');
+        }
+      } catch (e) {
+        b.textContent = '重启失败';
+        restore(b, '重启后端');
+      }
+    });
+    document.body.appendChild(b);
+  };
+  if (document.body) mount();
+  else document.addEventListener('DOMContentLoaded', mount);
+})();
+"#;
+
 /// 客户端配置（读取 exe 旁的 config.json；缺省用内置默认值）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -845,12 +888,42 @@ fn start_backend(state: State<'_, AppState>) -> Result<BackendStartResult, Strin
     Ok(result)
 }
 
+/// 重启 Harness 后端：杀掉当前监听端口的后端（本客户端启动的或外部实例），
+/// 再按解析器（本机安装优先）重新拉起并等待就绪。
+#[tauri::command]
+fn restart_backend(state: State<'_, AppState>) -> Result<BackendStartResult, String> {
+    let cfg = state.config.lock().unwrap().clone();
+    let resource_dir = state.resource_dir.clone();
+    let app_data_dir = state.app_data_dir.clone();
+
+    let owned = state.backend_pid.lock().unwrap().is_some();
+    let listener = if owned { None } else { listener_pid(&cfg.harness_url) };
+    match (owned, listener) {
+        (true, _) => {
+            if let Some(pid) = *state.backend_pid.lock().unwrap() {
+                kill_backend_process(pid);
+            }
+        }
+        (false, Some(pid)) => kill_external_process(pid),
+        (false, None) => {}
+    }
+    *state.backend_pid.lock().unwrap() = None;
+
+    let result = spawn_backend_impl(&cfg, &resource_dir, &app_data_dir)?;
+    *state.backend_pid.lock().unwrap() = result.pid;
+
+    let deadline = Instant::now() + Duration::from_secs(cfg.start_timeout_sec.max(10));
+    while Instant::now() < deadline && !backend_reachable(&cfg.harness_url) {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    Ok(result)
+}
+
 fn spawn_backend_impl(
     cfg: &ClientConfig,
     resource_dir: &Path,
     app_data_dir: &Path,
-) -> Result<BackendStartResult, String> {
-    let cmdline = resolve_backend_command(cfg, resource_dir, app_data_dir);
+) -> Result<BackendStartResult, String> {    let cmdline = resolve_backend_command(cfg, resource_dir, app_data_dir);
     if cmdline.is_empty() {
         return Err("未配置后端启动命令".into());
     }
@@ -1476,6 +1549,7 @@ pub fn run() {
                 .inner_size(1280.0, 860.0)
                 .min_inner_size(960.0, 640.0)
                 .center()
+                .initialization_script(RESTART_BUTTON_JS)
                 .build()?;
             restore_window(&win);
             let (harness_url, health_interval) = {
@@ -1494,6 +1568,7 @@ pub fn run() {
             get_config,
             check_backend,
             start_backend,
+            restart_backend,
             read_backend_log,
             debug_log,
             open_harness,
