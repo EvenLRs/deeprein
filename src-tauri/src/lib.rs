@@ -26,10 +26,11 @@ const ENSURE_PLUGIN_JS: &str = include_str!("../../scripts/ensure-plugin.mjs");
 /// 注入到 Harness 页面右下角的「重启后端」浮动按钮。
 /// 通过 WebviewWindowBuilder::initialization_script 注入，随主 webview 的每个页面执行；
 /// 仅在 http(s) 页面（Harness GUI）显示，启动页（tauri://）不显示。
+/// 按钮不调用 Tauri IPC（远程页面受 ACL 限制），而是导航到魔法路径 /__deeprein_restart__，
+/// 由 Rust 侧 on_navigation 拦截并执行后端重启。
 const RESTART_BUTTON_JS: &str = r#"
 (() => {
   if (!window.location.origin.startsWith('http')) return;
-  const restore = (b, t) => setTimeout(() => { b.disabled = false; b.textContent = t; }, 4000);
   const mount = () => {
     const b = document.createElement('button');
     b.textContent = '重启后端';
@@ -42,24 +43,11 @@ const RESTART_BUTTON_JS: &str = r#"
     });
     b.onmouseenter = () => { b.style.opacity = '1'; };
     b.onmouseleave = () => { b.style.opacity = '.85'; };
-    b.addEventListener('click', async () => {
+    b.addEventListener('click', () => {
       b.disabled = true; b.textContent = '重启中…';
-      try {
-        await window.__TAURI_INTERNALS__.invoke('restart_backend');
-        const up = await window.__TAURI_INTERNALS__.invoke('check_backend');
-        if (up) {
-          b.textContent = '已重启，刷新中…';
-          setTimeout(() => window.location.reload(), 800);
-        } else {
-          b.textContent = '重启完成但未就绪';
-          restore(b, '重启后端');
-        }
-      } catch (e) {
-        const msg = String((e && e.message) || e).slice(0, 60);
-        b.textContent = '重启失败: ' + msg;
-        try { window.__TAURI_INTERNALS__.invoke('debug_log', { text: 'restart button: ' + msg }); } catch (_) {}
-        restore(b, '重启后端');
-      }
+      window.location.href = '/__deeprein_restart__';
+      // 兜底：若 6 秒内未被 Rust 侧拦截处理（正常会刷新页面），还原按钮
+      setTimeout(() => { b.disabled = false; b.textContent = '重启后端'; }, 6000);
     });
     document.body.appendChild(b);
   };
@@ -892,8 +880,7 @@ fn start_backend(state: State<'_, AppState>) -> Result<BackendStartResult, Strin
 
 /// 重启 Harness 后端：杀掉当前监听端口的后端（本客户端启动的或外部实例），
 /// 再按解析器（本机安装优先）重新拉起并等待就绪。
-#[tauri::command]
-fn restart_backend(state: State<'_, AppState>) -> Result<BackendStartResult, String> {
+fn restart_backend_impl(state: &AppState) -> Result<BackendStartResult, String> {
     // 互斥锁抗中毒：任何线程先前持锁 panic 都不影响后续重启
     let cfg = state.config.lock().unwrap_or_else(|p| p.into_inner()).clone();
     let resource_dir = state.resource_dir.clone();
@@ -931,6 +918,11 @@ fn restart_backend(state: State<'_, AppState>) -> Result<BackendStartResult, Str
         std::thread::sleep(Duration::from_secs(1));
     }
     Ok(result)
+}
+
+#[tauri::command]
+fn restart_backend(state: State<'_, AppState>) -> Result<BackendStartResult, String> {
+    restart_backend_impl(&state)
 }
 
 fn spawn_backend_impl(
@@ -1584,6 +1576,36 @@ pub fn run() {
                 .min_inner_size(960.0, 640.0)
                 .center()
                 .initialization_script(RESTART_BUTTON_JS)
+                // Harness 页面（远程源）受 ACL 限制无法调自定义命令，
+                // 重启按钮改走「导航到魔法路径」由这里拦截执行。
+                .on_navigation({
+                    let handle = app.handle().clone();
+                    move |url| {
+                        if url.path().starts_with("/__deeprein_restart__") {
+                            let handle = handle.clone();
+                            std::thread::spawn(move || {
+                                let state = handle.state::<AppState>();
+                                match restart_backend_impl(&state) {
+                                    Ok(_) => {
+                                        if let Some(win) = handle.get_webview_window("main") {
+                                            let _ = win.eval("window.location.reload()");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        rust_log(&format!("on_navigation: 重启失败: {e}"));
+                                        let msg = e.replace('\\', "\\\\").replace('\'', "\\'");
+                                        if let Some(win) = handle.get_webview_window("main") {
+                                            let _ = win
+                                                .eval(&format!("window.alert('重启后端失败：{msg}')"));
+                                        }
+                                    }
+                                }
+                            });
+                            return false; // 拦截该导航，页面停留原处
+                        }
+                        true
+                    }
+                })
                 .build()?;
             restore_window(&win);
             let (harness_url, health_interval) = {
