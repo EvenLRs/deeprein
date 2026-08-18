@@ -23,38 +23,47 @@ const ENSURE_BACKEND_JS: &str = include_str!("../../scripts/ensure-backend.mjs")
 /// 运行时把随壳打包的 Harness 插件装入 web profile 的脚本（scripts/ensure-plugin.mjs）
 const ENSURE_PLUGIN_JS: &str = include_str!("../../scripts/ensure-plugin.mjs");
 
-/// 注入到 Harness 页面右下角的「重启后端」浮动按钮。
+/// 生成注入到 Harness 页面右下角的「重启后端」浮动按钮脚本。
 /// 通过 WebviewWindowBuilder::initialization_script 注入，随主 webview 的每个页面执行；
-/// 仅在 http(s) 页面（Harness GUI）显示，启动页（tauri://）不显示。
+/// 仅在当前页面 origin 与配置的 harness_url origin 一致时显示，启动页（Windows 上的 http://tauri.localhost、macOS/Linux 上的 tauri://）不显示。
 /// 按钮不调用 Tauri IPC（远程页面受 ACL 限制），而是导航到魔法路径 /__deeprein_restart__，
 /// 由 Rust 侧 on_navigation 拦截并执行后端重启。
-const RESTART_BUTTON_JS: &str = r#"
-(() => {
-  if (!window.location.origin.startsWith('http')) return;
-  const mount = () => {
+fn build_restart_button_js(harness_url: &str) -> String {
+    let Ok(url) = harness_url.parse::<tauri::Url>() else {
+        return String::new();
+    };
+    let target_origin = url.origin().ascii_serialization();
+    format!(
+        r#"
+(() => {{
+  const targetOrigin = {target_origin:?};
+  if (window.location.origin !== targetOrigin) return;
+  const mount = () => {{
     const b = document.createElement('button');
     b.textContent = '重启后端';
-    Object.assign(b.style, {
+    Object.assign(b.style, {{
       position: 'fixed', right: '12px', bottom: '12px', zIndex: '2147483647',
       padding: '6px 12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,.22)',
       background: 'rgba(15,25,45,.82)', color: '#e8eef8', cursor: 'pointer',
       fontSize: '12px', fontFamily: 'system-ui, -apple-system, sans-serif',
       boxShadow: '0 2px 10px rgba(0,0,0,.35)', opacity: '.85',
-    });
-    b.onmouseenter = () => { b.style.opacity = '1'; };
-    b.onmouseleave = () => { b.style.opacity = '.85'; };
-    b.addEventListener('click', () => {
+    }});
+    b.onmouseenter = () => {{ b.style.opacity = '1'; }};
+    b.onmouseleave = () => {{ b.style.opacity = '.85'; }};
+    b.addEventListener('click', () => {{
       b.disabled = true; b.textContent = '重启中…';
       window.location.href = '/__deeprein_restart__';
       // 兜底：若 6 秒内未被 Rust 侧拦截处理（正常会刷新页面），还原按钮
-      setTimeout(() => { b.disabled = false; b.textContent = '重启后端'; }, 6000);
-    });
+      setTimeout(() => {{ b.disabled = false; b.textContent = '重启后端'; }}, 6000);
+    }});
     document.body.appendChild(b);
-  };
+  }};
   if (document.body) mount();
   else document.addEventListener('DOMContentLoaded', mount);
-})();
-"#;
+}})();
+"#
+    )
+}
 
 /// 客户端配置（读取 exe 旁的 config.json；缺省用内置默认值）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1562,8 +1571,14 @@ pub fn run() {
                 .path()
                 .app_data_dir()
                 .unwrap_or_else(|_| exe_dir().join("data"));
+            let config = load_config();
+            let (harness_url, health_interval) = (
+                config.harness_url.clone(),
+                Duration::from_millis(config.health_check_interval_ms.max(1000)),
+            );
+            let restart_button_js = build_restart_button_js(&harness_url);
             app.manage(AppState {
-                config: Mutex::new(load_config()),
+                config: Mutex::new(config),
                 resource_dir,
                 app_data_dir,
                 backend_pid: Arc::new(Mutex::new(None)),
@@ -1575,7 +1590,7 @@ pub fn run() {
                 .inner_size(1280.0, 860.0)
                 .min_inner_size(960.0, 640.0)
                 .center()
-                .initialization_script(RESTART_BUTTON_JS)
+                .initialization_script(&restart_button_js)
                 // Harness 页面（远程源）受 ACL 限制无法调自定义命令，
                 // 重启按钮改走「导航到魔法路径」由这里拦截执行。
                 .on_navigation({
@@ -1608,14 +1623,6 @@ pub fn run() {
                 })
                 .build()?;
             restore_window(&win);
-            let (harness_url, health_interval) = {
-                let state = app.state::<AppState>();
-                let cfg = state.config.lock().unwrap();
-                (
-                    cfg.harness_url.clone(),
-                    Duration::from_millis(cfg.health_check_interval_ms.max(1000)),
-                )
-            };
             let _ = win.set_title("DeepRein · 后端检测中…");
             start_status_watcher(app.handle().clone(), harness_url, health_interval);
             Ok(())
