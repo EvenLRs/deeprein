@@ -5,7 +5,6 @@
 //   backend/dsh/node_modules/...   官方 dsh 包及其运行时依赖
 import { spawnSync } from 'node:child_process';
 import {
-  copyFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -260,28 +259,6 @@ for (const file of readdirSync(pluginDir)) {
   if (file.endsWith('.tgz')) rmSync(join(pluginDir, file), { force: true });
 }
 
-// dsh-messaging 动态插件的源码与伴随脚本先同步进启动壳包（单一事实来源在 .dsh-messaging/）。
-// CI 无 .dsh-messaging 时使用已入库的 plugins/dsh-messaging 拷贝。
-{
-  const messagingSrc = join(root, '.dsh-messaging');
-  const messagingPkg = join(root, 'plugins', 'dsh-messaging');
-  const syncFiles = [
-    ['dynamic', 'host.js'],
-    ['dynamic', 'client.js'],
-    ['dynamic', 'manifest.json'],
-    ['companion', 'crypto-helper.cjs'],
-    ['companion', 'discord-gateway.cjs'],
-    ['', 'config.example.json'],
-  ];
-  for (const [relDir, file] of syncFiles) {
-    const src = join(messagingSrc, relDir, file);
-    if (!existsSync(src)) continue;
-    const dst = join(messagingPkg, relDir, file);
-    mkdirSync(join(messagingPkg, relDir), { recursive: true });
-    copyFileSync(src, dst);
-  }
-}
-
 // 当前 dsh web profile 实际引用的插件清单（与 README 中的记录保持一致）：
 //   - 本地 fork 优先（本机当前安装的就是它）；CI 无该目录时回退到 npm 发布版
 const bundledPlugins = [
@@ -294,8 +271,8 @@ const bundledPlugins = [
   { name: 'dsh-browser', spec: 'dsh-browser@0.1.0' },
   { name: 'dsh-mnemon', spec: 'dsh-mnemon@0.1.4' },
   { name: 'dshmarket', spec: 'dshmarket@1.5.0' },
-  // dsh-messaging 启动壳：随 DeepRein 分发，自动注册/激活消息网关动态插件
-  { name: '@deeprein/dsh-messaging', local: join(root, 'plugins', 'dsh-messaging') },
+  // 消息渠道网关插件，构建时从 npm registry 拉取
+  { name: 'dsh-messaging', spec: 'dsh-messaging@0.1.2' },
 ];
 
 for (const p of bundledPlugins) {
