@@ -292,6 +292,31 @@ async function main() {
     process.env.PATH = nodeBinDir + delimiter + (process.env.PATH || '');
   }
 
+  // 在安装前先尝试读取已有的 allowScripts 白名单（防止 install 覆盖/重写 package.json）
+  const fallbackAllowScripts = [
+    '@deepseek-ai/dsh-subprocess-local',
+    '@google/genai',
+    'koffi',
+    'node-pty',
+    'protobufjs',
+  ];
+
+  function stripPkgVersion(spec) {
+    const s = String(spec || '').trim();
+    const lastAt = s.lastIndexOf('@');
+    return lastAt > 0 ? s.slice(0, lastAt) : s;
+  }
+
+  let preAllowScripts = [];
+  try {
+    const existingPkg = JSON.parse(readFileSync(join(dshDir, 'package.json'), 'utf8'));
+    if (existingPkg.allowScripts && typeof existingPkg.allowScripts === 'object') {
+      preAllowScripts = Object.keys(existingPkg.allowScripts);
+    }
+  } catch {
+    /* 首次安装时 package.json 可能尚未生成 */
+  }
+
   const npmInstallArgs = [
     'install',
     `@deepseek-ai/dsh@${latest}`,
@@ -306,8 +331,36 @@ async function main() {
   ];
   runNpm(nodeExe, npmCli, npmInstallArgs);
   if (npmMajor(nodeExe, npmCli) >= 11) {
-    runNpm(nodeExe, npmCli, ['approve-scripts', '--cache', npmCache, '--all'], dshDir);
-    runNpm(nodeExe, npmCli, ['rebuild', '--cache', npmCache], dshDir);
+    let postAllowScripts = [];
+    try {
+      const postPkg = JSON.parse(readFileSync(join(dshDir, 'package.json'), 'utf8'));
+      if (postPkg.allowScripts && typeof postPkg.allowScripts === 'object') {
+        postAllowScripts = Object.keys(postPkg.allowScripts);
+      }
+    } catch {
+      /* ignore */
+    }
+    const rawList = preAllowScripts.concat(postAllowScripts);
+    const normalized = rawList.map(stripPkgVersion).filter(Boolean);
+    const combined = Array.from(new Set(normalized));
+    const scriptsToApprove = combined.length > 0 ? combined : fallbackAllowScripts;
+    if (scriptsToApprove.length > 0) {
+      try {
+        runNpm(
+          nodeExe,
+          npmCli,
+          ['approve-scripts', '--cache', npmCache, '--no-allow-scripts-pin', ...scriptsToApprove],
+          dshDir,
+        );
+      } catch (err) {
+        log(`[警告] npm approve-scripts 执行异常（可能影响原生模块编译）: ${err.message || err}`);
+      }
+      try {
+        runNpm(nodeExe, npmCli, ['rebuild', '--cache', npmCache], dshDir);
+      } catch (err) {
+        log(`[警告] npm rebuild 执行异常（可能影响原生模块编译）: ${err.message || err}`);
+      }
+    }
   }
 
   // 安装完成后裁剪他平台/调试类冗余文件

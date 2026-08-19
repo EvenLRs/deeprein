@@ -240,9 +240,17 @@ if (!existsSync(dshBin)) {
     '--no-fund',
     '--no-package-lock',
   ]);
-  // npm 11 的 allowScripts 机制默认跳过未批准的安装脚本（node-pty/koffi 等原生包依赖它们）
+  // npm 11 的 allowScripts 机制默认跳过未批准的安装脚本
+  // 白名单：仅批准必需的原生/核心包脚本，不使用 --all
   if (npmMajor() >= 11) {
-    runNpm(['approve-scripts', '--all'], { cwd: dshDir });
+    const allowedScripts = [
+      '@deepseek-ai/dsh-subprocess-local',
+      '@google/genai',
+      'koffi',
+      'node-pty',
+      'protobufjs',
+    ];
+    runNpm(['approve-scripts', '--no-allow-scripts-pin', ...allowedScripts], { cwd: dshDir });
     runNpm(['rebuild'], { cwd: dshDir });
   }
 }
