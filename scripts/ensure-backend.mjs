@@ -74,14 +74,18 @@ function cmpVer(a, b) {
 }
 
 // ---------- 已安装版本 ----------
-function installedVersion(dshDir) {
-  const pkg = join(dshDir, 'node_modules', '@deepseek-ai', 'dsh', 'package.json');
+function installedPackageVersion(dshDir, pkgName) {
+  const pkg = join(dshDir, 'node_modules', ...pkgName.split('/'), 'package.json');
   try {
     const v = JSON.parse(readFileSync(pkg, 'utf8')).version;
     return typeof v === 'string' ? v : null;
   } catch {
     return null;
   }
+}
+
+function installedVersion(dshDir) {
+  return installedPackageVersion(dshDir, '@deepseek-ai/dsh');
 }
 
 // ---------- npm registry 最新版本 ----------
@@ -200,15 +204,6 @@ function runNpm(node, npmCli, argsArr, cwd) {
   if (r.status !== 0) throw new Error(`npm ${argsArr.join(' ')} 退出码 ${r.status ?? '未知'}`);
 }
 
-// npm 11+ 有 allowScripts 机制（默认跳过未批准安装脚本，原生包需要 approve + rebuild）
-function npmMajor(node, npmCli) {
-  const r = isScriptPath(npmCli)
-    ? spawnSync(node, [npmCli, '--version'], { encoding: 'utf8' })
-    : spawnSync(npmCli, ['--version'], { encoding: 'utf8', shell: process.platform === 'win32' });
-  const m = parseInt((r.stdout || '').trim().split('.')[0], 10);
-  return Number.isFinite(m) ? m : 0;
-}
-
 // ---------- 主流程 ----------
 async function main() {
   if (!target) throw new Error('缺少 --target 参数');
@@ -292,8 +287,8 @@ async function main() {
     process.env.PATH = nodeBinDir + delimiter + (process.env.PATH || '');
   }
 
-  // 在安装前先尝试读取已有的 allowScripts 白名单（防止 install 覆盖/重写 package.json）
-  const fallbackAllowScripts = [
+  // 白名单：仅允许编译运行必需的原生/核心依赖生命周期脚本，防范供应链投毒
+  const ALLOWED_SCRIPTS = [
     '@deepseek-ai/dsh-subprocess-local',
     '@google/genai',
     'koffi',
@@ -307,19 +302,11 @@ async function main() {
     return lastAt > 0 ? s.slice(0, lastAt) : s;
   }
 
-  let preAllowScripts = [];
-  try {
-    const existingPkg = JSON.parse(readFileSync(join(dshDir, 'package.json'), 'utf8'));
-    if (existingPkg.allowScripts && typeof existingPkg.allowScripts === 'object') {
-      preAllowScripts = Object.keys(existingPkg.allowScripts);
-    }
-  } catch {
-    /* 首次安装时 package.json 可能尚未生成 */
-  }
-
+  // 1. 初始安装：显式传入 --ignore-scripts，杜绝安装过程中执行任何依赖的未审生命周期脚本
   const npmInstallArgs = [
     'install',
     `@deepseek-ai/dsh@${latest}`,
+    '--ignore-scripts',
     '--cache',
     npmCache,
     '--prefix',
@@ -330,37 +317,34 @@ async function main() {
     '--no-package-lock',
   ];
   runNpm(nodeExe, npmCli, npmInstallArgs);
-  if (npmMajor(nodeExe, npmCli) >= 11) {
-    let postAllowScripts = [];
+
+  // 2. 定向构建：针对白名单中的包逐个执行 rebuild，单包失败只告警不阻断整体流程
+  for (const pkgName of ALLOWED_SCRIPTS) {
     try {
-      const postPkg = JSON.parse(readFileSync(join(dshDir, 'package.json'), 'utf8'));
-      if (postPkg.allowScripts && typeof postPkg.allowScripts === 'object') {
-        postAllowScripts = Object.keys(postPkg.allowScripts);
-      }
-    } catch {
-      /* ignore */
+      runNpm(nodeExe, npmCli, ['rebuild', '--cache', npmCache, pkgName], dshDir);
+    } catch (err) {
+      log(`[提示] 原生模块 ${pkgName} 定向构建未触发（可能已是预编译产物或无需重新构建）: ${err.message || err}`);
     }
-    const rawList = preAllowScripts.concat(postAllowScripts);
-    const normalized = rawList.map(stripPkgVersion).filter(Boolean);
-    const combined = Array.from(new Set(normalized));
-    const scriptsToApprove = combined.length > 0 ? combined : fallbackAllowScripts;
-    if (scriptsToApprove.length > 0) {
-      try {
-        runNpm(
-          nodeExe,
-          npmCli,
-          ['approve-scripts', '--cache', npmCache, '--no-allow-scripts-pin', ...scriptsToApprove],
-          dshDir,
-        );
-      } catch (err) {
-        log(`[警告] npm approve-scripts 执行异常（可能影响原生模块编译）: ${err.message || err}`);
+  }
+
+  // 3. 同步写回纯净的 allowScripts 白名单策略并清除历史 --all 残留
+  try {
+    const pkgJsonPath = join(dshDir, 'package.json');
+    if (existsSync(pkgJsonPath)) {
+      const pkgJson = JSON.parse(readFileSync(pkgJsonPath, 'utf8'));
+      const newAllowScripts = {};
+      for (const name of ALLOWED_SCRIPTS) {
+        const installedVer = installedPackageVersion(dshDir, name);
+        if (!installedVer) {
+          throw new Error(`无法读取已安装包 ${name} 的真实版本号，中止 allowScripts 策略写入`);
+        }
+        newAllowScripts[`${name}@${installedVer}`] = true;
       }
-      try {
-        runNpm(nodeExe, npmCli, ['rebuild', '--cache', npmCache], dshDir);
-      } catch (err) {
-        log(`[警告] npm rebuild 执行异常（可能影响原生模块编译）: ${err.message || err}`);
-      }
+      pkgJson.allowScripts = newAllowScripts;
+      writeFileSync(pkgJsonPath, JSON.stringify(pkgJson, null, 2) + '\n');
     }
+  } catch (err) {
+    log(`[警告] 同步 package.json allowScripts 失败: ${err.message || err}`);
   }
 
   // 安装完成后裁剪他平台/调试类冗余文件

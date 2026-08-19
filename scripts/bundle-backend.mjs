@@ -235,24 +235,49 @@ if (!existsSync(dshBin)) {
     '--prefix',
     dshDir,
     `@deepseek-ai/dsh@${dshVersion}`,
+    '--ignore-scripts',
     '--omit=dev',
     '--no-audit',
     '--no-fund',
     '--no-package-lock',
   ]);
-  // npm 11 的 allowScripts 机制默认跳过未批准的安装脚本
-  // 白名单：仅批准必需的原生/核心包脚本，不使用 --all
-  if (npmMajor() >= 11) {
-    const allowedScripts = [
-      '@deepseek-ai/dsh-subprocess-local',
-      '@google/genai',
-      'koffi',
-      'node-pty',
-      'protobufjs',
-    ];
-    runNpm(['approve-scripts', '--no-allow-scripts-pin', ...allowedScripts], { cwd: dshDir });
-    runNpm(['rebuild'], { cwd: dshDir });
+
+  const allowedScripts = [
+    '@deepseek-ai/dsh-subprocess-local',
+    '@google/genai',
+    'koffi',
+    'node-pty',
+    'protobufjs',
+  ];
+
+  for (const pkgName of allowedScripts) {
+    try {
+      runNpm(['rebuild', pkgName], { cwd: dshDir });
+    } catch (err) {
+      console.warn(`[提示] 原生模块 ${pkgName} 定向构建未触发: ${err.message || err}`);
+    }
   }
+
+  const pkgJsonPath = join(dshDir, 'package.json');
+  if (!existsSync(pkgJsonPath)) {
+    throw new Error(`无法找到后端根目录 package.json (${pkgJsonPath})，无法写入 allowScripts 策略`);
+  }
+  const pkgJson = JSON.parse(readFileSync(pkgJsonPath, 'utf8'));
+  const newAllowScripts = {};
+  for (const name of allowedScripts) {
+    const pkgFile = join(dshDir, 'node_modules', ...name.split('/'), 'package.json');
+    if (!existsSync(pkgFile)) {
+      throw new Error(`无法找到已安装包 ${name} 的 package.json (${pkgFile})`);
+    }
+    const pkgData = JSON.parse(readFileSync(pkgFile, 'utf8'));
+    const ver = pkgData.version;
+    if (!ver || typeof ver !== 'string') {
+      throw new Error(`已安装包 ${name} 缺少有效的 version 字段`);
+    }
+    newAllowScripts[`${name}@${ver}`] = true;
+  }
+  pkgJson.allowScripts = newAllowScripts;
+  writeFileSync(pkgJsonPath, JSON.stringify(pkgJson, null, 2) + '\n');
 }
 
 // 按目标平台裁剪冗余内容（他平台 prebuilds、头文件、sourcemap、文档）
