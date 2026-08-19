@@ -888,8 +888,8 @@ fn start_backend(state: State<'_, AppState>) -> Result<BackendStartResult, Strin
     Ok(result)
 }
 
-/// 重启 Harness 后端：杀掉当前监听端口的后端（本客户端启动的或外部实例），
-/// 再按解析器（本机安装优先）重新拉起并等待就绪。
+/// 重启 Harness 后端：杀掉当前监听端口的后端（本客户端启动的实例），
+/// 若端口被外部进程占用则返回冲突错误；再按解析器（本机安装优先）重新拉起并等待就绪。
 fn restart_backend_impl(state: &AppState) -> Result<BackendStartResult, String> {
     // 互斥锁抗中毒：任何线程先前持锁 panic 都不影响后续重启
     let cfg = lock_or_recover(&state.config).clone();
@@ -906,14 +906,16 @@ fn restart_backend_impl(state: &AppState) -> Result<BackendStartResult, String> 
             }
         }
         (false, Some(pid)) => {
-            if is_killable_backend(pid) {
-                kill_external_process(pid);
-            } else {
-                let name = process_name(pid).unwrap_or_else(|| "未知".into());
-                rust_log(&format!(
-                    "restart_backend: 端口占用进程 pid={pid} ({name}) 疑似非 Harness 后端，已跳过强杀"
-                ));
-            }
+            let name = process_name(pid).unwrap_or_else(|| "未知".into());
+            let port_str = cfg.harness_url.parse::<tauri::Url>().ok()
+                .and_then(|u| u.port_or_known_default())
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| cfg.harness_url.clone());
+            let err_msg = format!(
+                "端口 {port_str} 正被外部进程占用 (PID: {pid}, 映像名: {name})，无法自动重启。请手动退出该进程或在 config.json 中修改 harness_url。"
+            );
+            rust_log(&format!("restart_backend: {err_msg}"));
+            return Err(err_msg);
         }
         (false, None) => {}
     }
@@ -1033,8 +1035,8 @@ fn kill_backend_process(pid: u32) {
     }
 }
 
-/// 杀掉外部后端进程（不是本客户端启动的、非进程组组长）：Windows taskkill 整树，
-/// macOS 用普通 kill（外部进程不一定是我们建的进程组，不能加负号）
+/// 杀掉外部后端进程（保留供未来确认接管功能使用，当前不再自动调用）
+#[allow(dead_code)]
 fn kill_external_process(pid: u32) {
     #[cfg(windows)]
     {
@@ -1105,14 +1107,6 @@ fn process_name(pid: u32) -> Option<String> {
         } else {
             Some(text)
         }
-    }
-}
-
-/// 判断指定外部 PID 是否为可安全杀掉的 Node/Harness 后端
-fn is_killable_backend(pid: u32) -> bool {
-    match process_name(pid) {
-        Some(name) => name.to_lowercase().contains("node"),
-        None => false, // 无法确认为 node 进程时保守不杀，避免误杀无关服务
     }
 }
 
@@ -1396,7 +1390,7 @@ fn open_harness(window: WebviewWindow, state: State<'_, AppState>) -> Result<(),
     }
 
     // 2) 有待生效的插件变更（本次安装过，或上次安装后后端未被重启过）→ 重启后端加载插件。
-    //    后端不是本客户端启动的外部实例时，先关掉监听端口的旧进程，再由解析器（本机安装优先）拉起。
+    //    后端不是本客户端启动的外部实例时，不杀外部进程也不重复 spawn，仅记日志提醒用户手动重启。
     if plugins_pending(&app_data) {
         let owned = lock_or_recover(&state.backend_pid).is_some();
         let listener = if owned { None } else { listener_pid(&cfg.harness_url) };
@@ -1408,15 +1402,11 @@ fn open_harness(window: WebviewWindow, state: State<'_, AppState>) -> Result<(),
                 spawn_backend_impl(&cfg, &resource_dir, &app_data).ok()
             }
             (false, Some(pid)) => {
-                if is_killable_backend(pid) {
-                    kill_external_process(pid);
-                } else {
-                    let name = process_name(pid).unwrap_or_else(|| "未知".into());
-                    rust_log(&format!(
-                        "open_harness: 端口占用进程 pid={pid} ({name}) 疑似非 Harness 后端，已跳过强杀"
-                    ));
-                }
-                spawn_backend_impl(&cfg, &resource_dir, &app_data).ok()
+                let name = process_name(pid).unwrap_or_else(|| "未知".into());
+                rust_log(&format!(
+                    "open_harness: 检测到插件更新，但端口被外部实例占用 (PID: {pid}, 映像名: {name})。跳过自动强杀与拉起，请手动重启外部后端以加载新插件。"
+                ));
+                None
             }
             (false, None) => None, // 无监听者：由启动流程拉起新后端，自然加载插件
         };
@@ -1426,11 +1416,13 @@ fn open_harness(window: WebviewWindow, state: State<'_, AppState>) -> Result<(),
             while Instant::now() < deadline && !backend_reachable(&cfg.harness_url) {
                 std::thread::sleep(Duration::from_secs(1));
             }
-        }
-        // 仅当确实重启/拉起成功后清除待生效标记；失败则保留，下次启动重试
-        if restarted.is_some() || (listener.is_none() && !owned) {
+            // 仅当本客户端成功重启拉起后端后清除待生效标记
+            mark_plugins_ready(&app_data);
+        } else if listener.is_none() && !owned {
+            // 无监听且未受管（冷启动）：首次拉起时清除标记
             mark_plugins_ready(&app_data);
         }
+        // 注意：若端口被外部实例占用 (false, Some(pid))，不写入 ready 标记，保留 pending 以便下次启动重试
     }
 
     navigate_to_harness(&window, &cfg.harness_url)?;
