@@ -4,7 +4,12 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 export const name = '@deeprein/host-bridge'
-export const inject = ['webServer']
+// loader 必须显式声明：cordis 对未 inject 的服务属性访问会抛
+// `cannot get property "loader" without inject`（cordis/lib/index.js:671-697 的 proxy handler），
+// 于是 ctx.loader 会被 try/catch 吞掉写进 problems、令 ok 恒为 false——健康的后端也被误报异常。
+// 注意 ctx.get(name) 是另一套语义，明确「without the inject requirement」（同文件 :754-763），
+// 所以 invariants 走 ctx.get 无需声明。
+export const inject = ['webServer', 'loader']
 
 function getBridgeTokenPath() {
   if (process.env.DEEPREIN_BRIDGE_TOKEN_PATH) {
