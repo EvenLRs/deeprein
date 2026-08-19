@@ -68,6 +68,16 @@ jobs:
         if: matrix.os == 'macos-14'
         run: npm run build -- --target ${{ matrix.target }}
 
+      # 产物名后缀：短 commit SHA + 随机段。
+      # SHA 段保证可追溯（拿到产物能反查是哪次提交构建的），随机段保证同一提交
+      # 反复构建时产物名不重复（下载到同一目录不会互相覆盖）。
+      # 用 bash 内置 $RANDOM 而非 openssl/uuidgen，避免依赖 runner 上的外部工具。
+      - name: Compute artifact suffix
+        id: suffix
+        shell: bash
+        run: |
+          echo "value=$(git rev-parse --short=7 HEAD)-$(printf '%04x%04x' $RANDOM $RANDOM)" >> "$GITHUB_OUTPUT"
+
       # 上传产物。
       # 注意:不上传裸 .app 目录——upload-artifact 会丢弃其中的点文件(.github/.yarn/.bin 等),
       # 破坏 .app 的代码签名封印,解压后系统判「已损坏」(图标问号、双击无反应)。
@@ -76,7 +86,7 @@ jobs:
         if: matrix.os == 'windows-latest'
         uses: actions/upload-artifact@v4
         with:
-          name: deeprein-${{ matrix.label }}
+          name: deeprein-${{ matrix.label }}-${{ steps.suffix.outputs.value }}
           path: |
             src-tauri/target/${{ matrix.target }}/release/bundle/nsis/**/*
           if-no-files-found: error
@@ -85,7 +95,7 @@ jobs:
         if: matrix.os == 'macos-14'
         uses: actions/upload-artifact@v4
         with:
-          name: deeprein-${{ matrix.label }}
+          name: deeprein-${{ matrix.label }}-${{ steps.suffix.outputs.value }}
           path: |
             src-tauri/target/${{ matrix.target }}/release/bundle/dmg/**/*
             src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.tar.gz
