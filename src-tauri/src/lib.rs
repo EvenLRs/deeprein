@@ -137,6 +137,11 @@ struct AppState {
     backend_health: Mutex<BackendHealth>,
 }
 
+/// 互斥锁抗中毒获取 helper：任何线程持锁 panic 都不导致后续调用崩溃
+fn lock_or_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// 后端健康状态三态：在线（HTTP 2xx）/ 异常（端口通但服务不正常）/ 离线（连不上）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -560,7 +565,7 @@ fn run_update_script(
         let watched = child_mut.clone();
         std::thread::spawn(move || {
             std::thread::sleep(timeout);
-            let _ = watched.lock().unwrap().kill();
+            let _ = lock_or_recover(&watched).kill();
         });
     }
 
@@ -578,9 +583,7 @@ fn run_update_script(
             Err(_) => break,
         }
     }
-    let status = child_mut
-        .lock()
-        .unwrap()
+    let status = lock_or_recover(&child_mut)
         .wait()
         .map_err(|e| format!("等待更新脚本退出失败: {e}"))?;
 
@@ -682,7 +685,7 @@ fn run_plugin_script(
         let watched = child_mut.clone();
         std::thread::spawn(move || {
             std::thread::sleep(timeout);
-            let _ = watched.lock().unwrap().kill();
+            let _ = lock_or_recover(&watched).kill();
         });
     }
 
@@ -700,9 +703,7 @@ fn run_plugin_script(
             Err(_) => break,
         }
     }
-    let status = child_mut
-        .lock()
-        .unwrap()
+    let status = lock_or_recover(&child_mut)
         .wait()
         .map_err(|e| format!("等待插件安装脚本退出失败: {e}"))?;
 
@@ -856,13 +857,13 @@ fn check_backend_health(url_str: &str) -> BackendHealth {
 /// 探测后端是否可达（启动页轮询用）
 #[tauri::command]
 fn check_backend(state: State<'_, AppState>) -> bool {
-    check_backend_health(&state.config.lock().unwrap().harness_url) == BackendHealth::Online
+    check_backend_health(&lock_or_recover(&state.config).harness_url) == BackendHealth::Online
 }
 
 /// 读取当前配置（启动页用于决定探测地址与自动启动行为）
 #[tauri::command]
 fn get_config(state: State<'_, AppState>) -> ConfigView {
-    let cfg = state.config.lock().unwrap();
+    let cfg = lock_or_recover(&state.config);
     ConfigView {
         harness_url: cfg.harness_url.clone(),
         auto_start_backend: cfg.auto_start_backend,
@@ -876,13 +877,13 @@ fn get_config(state: State<'_, AppState>) -> ConfigView {
 /// 启动 Harness 后端：分离进程、无窗口，stdout/stderr 写入 exe 旁 backend.log
 #[tauri::command]
 fn start_backend(state: State<'_, AppState>) -> Result<BackendStartResult, String> {
-    let cfg = state.config.lock().unwrap().clone();
+    let cfg = lock_or_recover(&state.config).clone();
     let resource_dir = state.resource_dir.clone();
     let app_data_dir = state.app_data_dir.clone();
     let result = spawn_backend_impl(&cfg, &resource_dir, &app_data_dir)?;
     // 记录进程组组长 pid，供后端状态监测重启时先杀旧进程
     if let Some(pid) = result.pid {
-        *state.backend_pid.lock().unwrap() = Some(pid);
+        *lock_or_recover(&state.backend_pid) = Some(pid);
     }
     Ok(result)
 }
@@ -891,27 +892,32 @@ fn start_backend(state: State<'_, AppState>) -> Result<BackendStartResult, Strin
 /// 再按解析器（本机安装优先）重新拉起并等待就绪。
 fn restart_backend_impl(state: &AppState) -> Result<BackendStartResult, String> {
     // 互斥锁抗中毒：任何线程先前持锁 panic 都不影响后续重启
-    let cfg = state.config.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let cfg = lock_or_recover(&state.config).clone();
     let resource_dir = state.resource_dir.clone();
     let app_data_dir = state.app_data_dir.clone();
 
-    let owned = state
-        .backend_pid
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .is_some();
+    let owned = lock_or_recover(&state.backend_pid).is_some();
     let listener = if owned { None } else { listener_pid(&cfg.harness_url) };
     match (owned, listener) {
         (true, _) => {
-            let pid = *state.backend_pid.lock().unwrap_or_else(|p| p.into_inner());
+            let pid = *lock_or_recover(&state.backend_pid);
             if let Some(pid) = pid {
                 kill_backend_process(pid);
             }
         }
-        (false, Some(pid)) => kill_external_process(pid),
+        (false, Some(pid)) => {
+            if is_killable_backend(pid) {
+                kill_external_process(pid);
+            } else {
+                let name = process_name(pid).unwrap_or_else(|| "未知".into());
+                rust_log(&format!(
+                    "restart_backend: 端口占用进程 pid={pid} ({name}) 疑似非 Harness 后端，已跳过强杀"
+                ));
+            }
+        }
         (false, None) => {}
     }
-    *state.backend_pid.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    *lock_or_recover(&state.backend_pid) = None;
 
     let result = match spawn_backend_impl(&cfg, &resource_dir, &app_data_dir) {
         Ok(r) => r,
@@ -920,7 +926,7 @@ fn restart_backend_impl(state: &AppState) -> Result<BackendStartResult, String> 
             return Err(e);
         }
     };
-    *state.backend_pid.lock().unwrap_or_else(|p| p.into_inner()) = result.pid;
+    *lock_or_recover(&state.backend_pid) = result.pid;
 
     let deadline = Instant::now() + Duration::from_secs(cfg.start_timeout_sec.max(10));
     while Instant::now() < deadline && !backend_reachable(&cfg.harness_url) {
@@ -1052,6 +1058,64 @@ fn kill_external_process(pid: u32) {
     }
 }
 
+/// 查询指定 PID 的进程名称（映像名）
+fn process_name(pid: u32) -> Option<String> {
+    #[cfg(windows)]
+    {
+        let mut cmd = Command::new("tasklist");
+        cmd.args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // 隐藏 tasklist 控制台窗口
+        let out = cmd.output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let trimmed = line.trim();
+            // 只认 /FO CSV 的数据行：首字段必为带引号的映像名（"node.exe","1234",...）。
+            // 不能靠 starts_with("INFO:") 排除“无匹配”提示——该提示已本地化
+            // （中文系统为「信息: 没有运行的任务匹配指定标准。」），前缀判断会失效，
+            // 导致把整段提示当成进程名返回。判断引号则与系统语言无关。
+            if !trimmed.starts_with('"') {
+                continue;
+            }
+            let name = match trimmed.split(',').next() {
+                Some(field) => field.trim_matches('"').trim(),
+                None => continue,
+            };
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        let out = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+}
+
+/// 判断指定外部 PID 是否为可安全杀掉的 Node/Harness 后端
+fn is_killable_backend(pid: u32) -> bool {
+    match process_name(pid) {
+        Some(name) => name.to_lowercase().contains("node"),
+        None => false, // 无法确认为 node 进程时保守不杀，避免误杀无关服务
+    }
+}
+
 /// 找到监听 harness_url 端口的进程 PID（跨平台：Windows netstat / macOS lsof）
 fn listener_pid(harness_url: &str) -> Option<u32> {
     let url: tauri::Url = harness_url.parse().ok()?;
@@ -1125,7 +1189,7 @@ fn rust_log(text: &str) {
 /// 读取后端日志尾部（排障用）
 #[tauri::command]
 fn read_backend_log(state: State<'_, AppState>, lines: Option<usize>) -> String {
-    let cfg = state.config.lock().unwrap();
+    let cfg = lock_or_recover(&state.config);
     let log_path = exe_dir().join(&cfg.backend_log_file);
     read_log_tail(&log_path, lines)
 }
@@ -1152,7 +1216,7 @@ fn read_log_tail(log_path: &Path, lines: Option<usize>) -> String {
 /// 当前后端版本与更新开关（启动页先调用，用于展示与决定是否检查更新）
 #[tauri::command]
 fn get_update_info(state: State<'_, AppState>) -> UpdateInfo {
-    let cfg = state.config.lock().unwrap();
+    let cfg = lock_or_recover(&state.config);
     let (current_version, current_source) =
         current_backend_version(&state.app_data_dir, &state.resource_dir);
     UpdateInfo {
@@ -1169,7 +1233,7 @@ fn get_update_info(state: State<'_, AppState>) -> UpdateInfo {
 /// 放到阻塞线程池执行，避免阻塞主线程（同步命令会卡 UI）。
 #[tauri::command]
 async fn check_update(state: State<'_, AppState>) -> Result<UpdateCheck, String> {
-    let cfg = state.config.lock().unwrap().clone();
+    let cfg = lock_or_recover(&state.config).clone();
     let resource_dir = state.resource_dir.clone();
     let app_data_dir = state.app_data_dir.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -1183,7 +1247,7 @@ async fn check_update(state: State<'_, AppState>) -> Result<UpdateCheck, String>
 /// 可能耗时数分钟（下载依赖），同样放到阻塞线程池；进度见 update.log（read_update_log 轮询）。
 #[tauri::command]
 async fn install_update(state: State<'_, AppState>) -> Result<UpdateCheck, String> {
-    let cfg = state.config.lock().unwrap().clone();
+    let cfg = lock_or_recover(&state.config).clone();
     let resource_dir = state.resource_dir.clone();
     let app_data_dir = state.app_data_dir.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -1199,7 +1263,7 @@ async fn ensure_plugins(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<PluginEnsureResult, String> {
-    let cfg = state.config.lock().unwrap().clone();
+    let cfg = lock_or_recover(&state.config).clone();
     let resource_dir = state.resource_dir.clone();
     let app_data_dir = state.app_data_dir.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -1309,7 +1373,7 @@ fn debug_log(text: String) {
 /// 让主窗口从启动页导航到 Harness 页面
 #[tauri::command]
 fn open_harness(window: WebviewWindow, state: State<'_, AppState>) -> Result<(), String> {
-    let cfg = state.config.lock().unwrap().clone();
+    let cfg = lock_or_recover(&state.config).clone();
     let app_data = state.app_data_dir.clone();
     let resource_dir = state.resource_dir.clone();
     let home = window
@@ -1334,23 +1398,30 @@ fn open_harness(window: WebviewWindow, state: State<'_, AppState>) -> Result<(),
     // 2) 有待生效的插件变更（本次安装过，或上次安装后后端未被重启过）→ 重启后端加载插件。
     //    后端不是本客户端启动的外部实例时，先关掉监听端口的旧进程，再由解析器（本机安装优先）拉起。
     if plugins_pending(&app_data) {
-        let owned = state.backend_pid.lock().unwrap().is_some();
+        let owned = lock_or_recover(&state.backend_pid).is_some();
         let listener = if owned { None } else { listener_pid(&cfg.harness_url) };
         let restarted = match (owned, listener) {
             (true, _) => {
-                if let Some(pid) = *state.backend_pid.lock().unwrap() {
+                if let Some(pid) = *lock_or_recover(&state.backend_pid) {
                     kill_backend_process(pid);
                 }
                 spawn_backend_impl(&cfg, &resource_dir, &app_data).ok()
             }
             (false, Some(pid)) => {
-                kill_external_process(pid);
+                if is_killable_backend(pid) {
+                    kill_external_process(pid);
+                } else {
+                    let name = process_name(pid).unwrap_or_else(|| "未知".into());
+                    rust_log(&format!(
+                        "open_harness: 端口占用进程 pid={pid} ({name}) 疑似非 Harness 后端，已跳过强杀"
+                    ));
+                }
                 spawn_backend_impl(&cfg, &resource_dir, &app_data).ok()
             }
             (false, None) => None, // 无监听者：由启动流程拉起新后端，自然加载插件
         };
         if let Some(ref backend) = restarted {
-            *state.backend_pid.lock().unwrap() = backend.pid;
+            *lock_or_recover(&state.backend_pid) = backend.pid;
             let deadline = Instant::now() + Duration::from_secs(cfg.start_timeout_sec.max(10));
             while Instant::now() < deadline && !backend_reachable(&cfg.harness_url) {
                 std::thread::sleep(Duration::from_secs(1));
@@ -1364,8 +1435,8 @@ fn open_harness(window: WebviewWindow, state: State<'_, AppState>) -> Result<(),
 
     navigate_to_harness(&window, &cfg.harness_url)?;
     // 首次进入 Harness 后启动后端状态监测线程（只启动一次）
-    if cfg.monitor_backend && !*state.monitor_started.lock().unwrap() {
-        *state.monitor_started.lock().unwrap() = true;
+    if cfg.monitor_backend && !*lock_or_recover(&state.monitor_started) {
+        *lock_or_recover(&state.monitor_started) = true;
         start_backend_monitor(
             window.app_handle().clone(),
             cfg,
@@ -1448,7 +1519,7 @@ fn start_backend_monitor(
                         continue;
                     }
                     rust_log("monitor: 用户选择重启后端");
-                    if let Some(pid) = *backend_pid.lock().unwrap() {
+                    if let Some(pid) = *lock_or_recover(&backend_pid) {
                         rust_log(&format!("monitor: 终止旧后端进程组 pid={pid}"));
                         kill_backend_process(pid);
                     }
@@ -1456,7 +1527,7 @@ fn start_backend_monitor(
                     match restart {
                         Ok(r) => {
                             if let Some(pid) = r.pid {
-                                *backend_pid.lock().unwrap() = Some(pid);
+                                *lock_or_recover(&backend_pid) = Some(pid);
                             }
                             rust_log("monitor: 已重新启动后端，等待就绪…");
                             let deadline = Instant::now()
@@ -1525,7 +1596,7 @@ fn start_status_watcher(app: AppHandle, harness_url: String, interval: Duration)
             if last != Some(health) {
                 last = Some(health);
                 if let Some(state) = app.try_state::<AppState>() {
-                    *state.backend_health.lock().unwrap() = health;
+                    *lock_or_recover(&state.backend_health) = health;
                 }
                 let _ = app.emit(
                     "backend-status-changed",
