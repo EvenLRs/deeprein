@@ -13,11 +13,16 @@
 import { spawnSync } from 'node:child_process';
 import {
   appendFileSync,
+  closeSync,
   copyFileSync,
   existsSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  renameSync,
   rmSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -65,6 +70,46 @@ function log(msg) {
   }
 }
 
+function writeProfileManifestAtomic(manifestPath, obj) {
+  const dir = dirname(manifestPath);
+  const tempPath = join(dir, `.manifest.tmp.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}`);
+  const content = JSON.stringify(obj, null, 2) + '\n';
+  let fd = null;
+  try {
+    fd = openSync(tempPath, 'w');
+    writeFileSync(fd, content);
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = null;
+  } catch (err) {
+    if (fd !== null) {
+      try { closeSync(fd); } catch { /* ignore */ }
+      fd = null;
+    }
+    try {
+      if (existsSync(tempPath)) unlinkSync(tempPath);
+    } catch {
+      /* ignore */
+    }
+    throw new Error(`写入 profile manifest 临时文件失败 (${tempPath}): ${err.message || err}`);
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd); } catch { /* ignore */ }
+    }
+  }
+
+  try {
+    renameSync(tempPath, manifestPath);
+  } catch (err) {
+    try {
+      if (existsSync(tempPath)) unlinkSync(tempPath);
+    } catch {
+      /* ignore */
+    }
+    throw new Error(`原子更新 profile manifest 失败 (${manifestPath}): ${err.message || err}`);
+  }
+}
+
 function installedVersion(profileDir, name) {
   const pkg = join(profileDir, 'node_modules', name, 'package.json');
   try {
@@ -79,7 +124,7 @@ const RETIRED_PACKAGES = [
   { name: '@deeprein/dsh-messaging', supersededBy: 'dsh-messaging' },
 ];
 
-function pruneRetiredPackages(profileDir, pnpmCli, nodeExe) {
+function pruneRetiredPackages(profileDir, pnpmCli, nodeExe, manifestPlugins) {
   const manifestPath = join(profileDir, 'package.json');
   if (!existsSync(manifestPath)) return [];
   let manifest;
@@ -92,28 +137,42 @@ function pruneRetiredPackages(profileDir, pnpmCli, nodeExe) {
   const removed = [];
   const deps = manifest.dependencies || {};
   const bundles = Array.isArray(manifest.dsh?.profile?.bundles) ? manifest.dsh.profile.bundles : [];
-  let manifestChanged = false;
 
   for (const item of RETIRED_PACKAGES) {
     const isPresentInDeps = Object.prototype.hasOwnProperty.call(deps, item.name);
     const isPresentInBundles = bundles.includes(item.name);
-    const isInstalled = Boolean(installedVersion(profileDir, item.name));
+    const staleDir = join(profileDir, 'node_modules', item.name);
+    const isPresentInDisk = existsSync(staleDir);
 
-    if (!isPresentInDeps && !isPresentInBundles && !isInstalled) {
+    if (!isPresentInDeps && !isPresentInBundles && !isPresentInDisk) {
       continue;
     }
 
-    // 守卫：只有当取代它的新包确实已安装在 profile 时才执行移除，避免功能真空
-    if (item.supersededBy && !installedVersion(profileDir, item.supersededBy)) {
-      log(`[退役插件] 检测到 ${item.name}，但取代包 ${item.supersededBy} 尚未安装，延后移除`);
-      continue;
+    // 守卫：只有当取代它的新包不仅在 manifestPlugins 中明确声明预期版本，且当前安装版本完全与之匹配时，才允许移除旧包
+    if (item.supersededBy) {
+      const currentNewVersion = installedVersion(profileDir, item.supersededBy);
+      const expectedPlugin = Array.isArray(manifestPlugins)
+        ? manifestPlugins.find((p) => p.name === item.supersededBy)
+        : null;
+      const expectedVersion = expectedPlugin ? expectedPlugin.version : null;
+
+      if (!expectedPlugin || !expectedVersion) {
+        log(
+          `[退役插件] 配置错误：退役插件 ${item.name} 的取代包 ${item.supersededBy} 未在当前安装清单中声明版本，保留旧包跳过移除`,
+        );
+        continue;
+      }
+
+      if (currentNewVersion !== expectedVersion) {
+        log(
+          `[退役插件] 检测到 ${item.name}，但取代包 ${item.supersededBy} 版本尚未就绪（当前: ${currentNewVersion ?? '未安装'}，期望: ${expectedVersion}），延后移除`,
+        );
+        continue;
+      }
     }
 
     log(`[退役插件] 正在移除已被取代的旧插件：${item.name}（取代包：${item.supersededBy || 'none'}）`);
 
-    // 注意：pnpm remove 不支持 --ignore-scripts（那是 pnpm add 的选项），传了会直接报
-    // "Unknown option: 'ignore-scripts'" 而整条命令失败。remove 本身不跑安装脚本，无需该选项。
-    // 另：remove 要求依赖仍在 package.json 中，故必须在下面的 manifest 手术之前执行。
     if (pnpmCli && existsSync(pnpmCli) && isPresentInDeps) {
       const removeRun = spawnSync(
         nodeExe,
@@ -124,39 +183,45 @@ function pruneRetiredPackages(profileDir, pnpmCli, nodeExe) {
       if (removeRun.stderr && removeRun.status !== 0) log(removeRun.stderr.trimEnd());
     }
 
-    // 重新读取或直接更新 manifest（防止 pnpm remove 修改了其他字段）
-    try {
-      const currentManifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
-      if (currentManifest.dependencies && currentManifest.dependencies[item.name]) {
-        delete currentManifest.dependencies[item.name];
-        manifestChanged = true;
+    // 重新读取并原子更新 manifest
+    const currentManifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    let itemManifestChanged = false;
+    if (currentManifest.dependencies && currentManifest.dependencies[item.name]) {
+      delete currentManifest.dependencies[item.name];
+      itemManifestChanged = true;
+    }
+    if (Array.isArray(currentManifest.dsh?.profile?.bundles)) {
+      const idx = currentManifest.dsh.profile.bundles.indexOf(item.name);
+      if (idx >= 0) {
+        currentManifest.dsh.profile.bundles.splice(idx, 1);
+        itemManifestChanged = true;
       }
-      if (Array.isArray(currentManifest.dsh?.profile?.bundles)) {
-        const idx = currentManifest.dsh.profile.bundles.indexOf(item.name);
-        if (idx >= 0) {
-          currentManifest.dsh.profile.bundles.splice(idx, 1);
-          manifestChanged = true;
-        }
-      }
-      if (manifestChanged) {
-        writeFileSync(manifestPath, JSON.stringify(currentManifest, null, 2) + '\n');
-      }
-    } catch {
-      /* ignore */
+    }
+    if (itemManifestChanged) {
+      writeProfileManifestAtomic(manifestPath, currentManifest);
     }
 
-    // 兜底删除残留目录：pnpm remove 不可用或失败（文件锁、EPERM）时，manifest 已清理但
-    // node_modules 里仍留着旧包。此时若不删，installedVersion 会一直判定「已安装」，
-    // 导致每次启动都重复走一遍移除流程、始终返回 installed=true，跳过逻辑永不生效。
-    // 该残留目录对 loader 无害（reconcileBundles 只遍历 manifest 列出的插件，不会把它加回
-    // bundles），但会拖慢每次启动，故一并清掉以保证幂等。
+    // 兜底清理物理残留目录
     try {
-      const staleDir = join(profileDir, 'node_modules', item.name);
       if (existsSync(staleDir)) {
         rmSync(staleDir, { recursive: true, force: true });
       }
     } catch (err) {
-      log(`[退役插件] 残留目录清理失败（不影响加载）：${err?.message ?? err}`);
+      log(`[退役插件] 残留目录清理失败：${err?.message ?? err}`);
+    }
+
+    // 三态严格验证：确认 dependencies、bundles、node_modules 均不再含有旧包
+    const verifiedManifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    const inDeps = Boolean(verifiedManifest.dependencies && verifiedManifest.dependencies[item.name]);
+    const inBundles = Array.isArray(verifiedManifest.dsh?.profile?.bundles) && verifiedManifest.dsh.profile.bundles.includes(item.name);
+    const inDisk = existsSync(staleDir);
+
+    if (inDeps || inBundles || inDisk) {
+      const reasons = [];
+      if (inDeps) reasons.push('dependencies 残留');
+      if (inBundles) reasons.push('dsh.profile.bundles 残留');
+      if (inDisk) reasons.push('node_modules 物理目录残留');
+      throw new Error(`退役插件 ${item.name} 清理不彻底：${reasons.join(', ')}`);
     }
 
     removed.push(item.name);
@@ -188,7 +253,7 @@ function reconcileBundles(profileDir, manifestPlugins) {
   }
   if (!changed) return false;
   manifest.dsh = { ...(manifest.dsh ?? {}), profile: { ...(manifest.dsh?.profile ?? {}), bundles } };
-  writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+  writeProfileManifestAtomic(manifestPath, manifest);
   return true;
 }
 
@@ -209,7 +274,7 @@ try {
   }
 
   const missing = plugins.filter((p) => installedVersion(profile, p.name) !== p.version);
-  const retiredRemoved = pruneRetiredPackages(profile, pnpmCli, nodeExe);
+  const retiredRemoved = pruneRetiredPackages(profile, pnpmCli, nodeExe, plugins);
   const reconciled = reconcileBundles(profile, plugins);
   if (!missing.length && !reconciled && !retiredRemoved.length) {
     log('Harness 插件均已安装且版本一致，跳过');
@@ -253,9 +318,6 @@ try {
     if (run.status !== 0) {
       throw new Error(`pnpm add 退出码 ${run.status ?? '未知'}`);
     }
-    // pnpm add 之后再次 pruneRetiredPackages + reconcile，确保 bundles 列表包含新装声明且不含退役包
-    pruneRetiredPackages(profile, pnpmCli, nodeExe);
-    reconcileBundles(profile, plugins);
   }
 
   const installed = plugins.map((p) => ({
@@ -265,6 +327,13 @@ try {
   }));
   const bad = installed.filter((x) => x.version !== x.expected);
   if (bad.length) throw new Error('安装后版本校验失败：' + JSON.stringify(bad));
+
+  // 新插件已安装并严格通过最终版本校验后，再次执行退役清理与 reconcile
+  const secondPassRemoved = pruneRetiredPackages(profile, pnpmCli, nodeExe, plugins);
+  for (const r of secondPassRemoved) {
+    if (!retiredRemoved.includes(r)) retiredRemoved.push(r);
+  }
+  reconcileBundles(profile, plugins);
 
   if (target) {
     mkdirSync(target, { recursive: true });
