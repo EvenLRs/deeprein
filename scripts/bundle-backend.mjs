@@ -281,6 +281,10 @@ const bundledPlugins = [
   { name: 'dshmarket', spec: 'dshmarket@1.5.0' },
   // 消息渠道网关插件，构建时从 npm registry 拉取
   { name: 'dsh-messaging', spec: 'dsh-messaging@0.1.2' },
+  // 本仓库自带的 host 桥插件：向外壳暴露后端内部健康/诊断状态。
+  // 与外壳强耦合、版本必须同步，故随仓库分发而非发 npm；无 fallback 是有意的——
+  // 目录已入库必然存在，若被误删则构建响亮失败，优于静默少装一个一方插件。
+  { name: '@deeprein/host-bridge', local: join(root, 'plugins', 'deeprein-host-bridge') },
 ];
 
 for (const p of bundledPlugins) {

@@ -1,0 +1,5 @@
+# 把 deeprein-host-bridge 插件挂载进 web profile 的 host 插件层。
+# id 全局唯一，勿与其它 bundle 重复（例如 dshmsg-boot 等）。
+- insert:
+    - id: deeprein-host-bridge
+      name: '@deeprein/host-bridge'
