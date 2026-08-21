@@ -142,6 +142,49 @@ fn lock_or_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// 生成 32 字节密码学安全随机 Hex Token，若系统熵源不可用则直接返回 Err
+fn generate_bridge_token() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).map_err(|e| format!("系统熵源不可用，无法生成安全 Token: {e}"))?;
+    let mut hex = String::with_capacity(64);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(hex, "{:02x}", b);
+    }
+    Ok(hex)
+}
+
+/// 原子写入 Bridge Token 文件（先写临时文件再 rename）
+fn write_bridge_token_atomic(token_path: &Path, token: &str) -> Result<(), String> {
+    let dir = token_path
+        .parent()
+        .ok_or_else(|| "无法获取 token 目录".to_string())?;
+    fs::create_dir_all(dir).map_err(|e| format!("创建 token 目录失败: {e}"))?;
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut rand_bytes = [0u8; 8];
+    let _ = getrandom::getrandom(&mut rand_bytes);
+    let rand_suffix: u64 = u64::from_le_bytes(rand_bytes);
+    let temp_name = format!(".bridge-token.tmp.{pid}.{nanos}.{rand_suffix:016x}");
+    let temp_path = dir.join(temp_name);
+
+    let write_res = (|| -> std::io::Result<()> {
+        fs::write(&temp_path, token)?;
+        fs::rename(&temp_path, token_path)?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_res {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!("原子写入 token 文件失败: {e}"));
+    }
+
+    Ok(())
+}
+
 /// 后端健康状态三态：在线（HTTP 2xx）/ 异常（端口通但服务不正常）/ 离线（连不上）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -789,10 +832,9 @@ fn backend_reachable(url_str: &str) -> bool {
     false
 }
 
-/// 后端健康探测：HTTP GET 根路径，按响应区分三态。
-/// 仅 TCP 连接会把「端口通但服务已坏」（如进程僵尸、对所有请求回 400）误判为在线，
-/// 因此必须读到合法 HTTP 状态行，且 2xx 才算在线。
-fn check_backend_health(url_str: &str) -> BackendHealth {
+/// 后端健康探测：优先读取 host-bridge 插件的 /__deeprein/health 端点获取真实内部状态。
+/// 若端点不可用（404/401/超时等未装插件或旧后端场景），平滑降级为 HTTP GET 根路径探测。
+fn check_backend_health(url_str: &str, app_data_dir: Option<&Path>) -> BackendHealth {
     let url = match url_str.parse::<tauri::Url>() {
         Ok(u) => u,
         Err(_) => return BackendHealth::Offline,
@@ -802,11 +844,15 @@ fn check_backend_health(url_str: &str) -> BackendHealth {
         None => return BackendHealth::Offline,
     };
     let port = url.port_or_known_default().unwrap_or(80);
-    let path = if url.path().is_empty() { "/" } else { url.path() };
     let addrs = match (host.as_str(), port).to_socket_addrs() {
         Ok(a) => a,
         Err(_) => return BackendHealth::Offline,
     };
+
+    let token = app_data_dir.and_then(|dir| {
+        let path = dir.join("bridge-token");
+        fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+    });
 
     for addr in addrs {
         let mut stream = match std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
@@ -822,17 +868,62 @@ fn check_backend_health(url_str: &str) -> BackendHealth {
         } else {
             format!("{host}:{port}")
         };
+
+        // 1. 优先尝试请求 host-bridge 健康检查端点（仅限本地安全地址发送 token，杜绝泄露至远程）
+        let is_local_host = host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost") || host == "::1";
+        if is_local_host {
+            if let Some(ref tok) = token {
+                let req = format!(
+                    "GET /__deeprein/health HTTP/1.1\r\nHost: {host_header}\r\nAuthorization: Bearer {tok}\r\nConnection: close\r\nAccept: application/json\r\n\r\n"
+                );
+                if stream.write_all(req.as_bytes()).is_ok() {
+                    let mut resp_bytes = Vec::new();
+                    let _ = stream.read_to_end(&mut resp_bytes);
+                    let resp_str = String::from_utf8_lossy(&resp_bytes);
+                    if let Some((headers, body)) = resp_str.split_once("\r\n\r\n") {
+                        let mut parts = headers.lines().next().unwrap_or("").split_whitespace();
+                        let _ver = parts.next();
+                        let status_code = parts.next().and_then(|c| c.parse::<u16>().ok()).unwrap_or(0);
+                        if status_code == 200 {
+                            #[derive(Deserialize)]
+                            struct BridgeHealthResponse {
+                                ok: bool,
+                                problems: Option<Vec<String>>,
+                            }
+                            if let Ok(data) = serde_json::from_str::<BridgeHealthResponse>(body.trim()) {
+                                if data.ok && data.problems.as_ref().map_or(true, |p| p.is_empty()) {
+                                    return BackendHealth::Online;
+                                } else {
+                                    if let Some(probs) = data.problems {
+                                        rust_log(&format!("check_backend_health: host-bridge 报告内部异常: {:?}", probs));
+                                    }
+                                    return BackendHealth::Degraded;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. 降级回退：手写 HTTP GET 根路径探测三态
+        let mut fallback_stream = match std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+            Ok(s) => s,
+            Err(_) => return BackendHealth::Degraded,
+        };
+        let _ = fallback_stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let _ = fallback_stream.set_write_timeout(Some(Duration::from_secs(2)));
+        let path = if url.path().is_empty() { "/" } else { url.path() };
         let request = format!(
             "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\nAccept: */*\r\n\r\n"
         );
-        if stream.write_all(request.as_bytes()).is_err() {
-            return BackendHealth::Degraded; // 端口通但写不进去 → 服务异常
+        if fallback_stream.write_all(request.as_bytes()).is_err() {
+            return BackendHealth::Degraded;
         }
-        // 只读状态行（最多 512 字节），不关心响应体
         let mut head = Vec::new();
         let mut byte = [0u8; 1];
         loop {
-            match stream.read(&mut byte) {
+            match fallback_stream.read(&mut byte) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
                     head.push(byte[0]);
@@ -848,7 +939,7 @@ fn check_backend_health(url_str: &str) -> BackendHealth {
         return match parts.next().and_then(|code| code.parse::<u16>().ok()) {
             Some(code) if (200..300).contains(&code) => BackendHealth::Online,
             Some(_) => BackendHealth::Degraded,
-            None => BackendHealth::Degraded, // 端口通但不是合法 HTTP 响应
+            None => BackendHealth::Degraded,
         };
     }
     BackendHealth::Offline
@@ -857,7 +948,7 @@ fn check_backend_health(url_str: &str) -> BackendHealth {
 /// 探测后端是否可达（启动页轮询用）
 #[tauri::command]
 fn check_backend(state: State<'_, AppState>) -> bool {
-    check_backend_health(&lock_or_recover(&state.config).harness_url) == BackendHealth::Online
+    check_backend_health(&lock_or_recover(&state.config).harness_url, Some(&state.app_data_dir)) == BackendHealth::Online
 }
 
 /// 读取当前配置（启动页用于决定探测地址与自动启动行为）
@@ -982,6 +1073,14 @@ fn spawn_backend_impl(
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+
+    // 生成并注入 host-bridge 认证 token（必须安全成功生成并原子写入，否则拒绝启动）
+    let token = generate_bridge_token()?;
+    let token_path = app_data_dir.join("bridge-token");
+    write_bridge_token_atomic(&token_path, &token)?;
+    cmd.env("DEEPREIN_BRIDGE_TOKEN_PATH", &token_path);
+    cmd.env("DEEPREIN_APP_DATA_DIR", app_data_dir);
+
     if let Some(cwd) = &cfg.backend_cwd {
         if !cwd.is_empty() {
             cmd.current_dir(cwd);
@@ -1584,7 +1683,8 @@ fn start_status_watcher(app: AppHandle, harness_url: String, interval: Duration)
     std::thread::spawn(move || {
         let mut last: Option<BackendHealth> = None;
         loop {
-            let health = check_backend_health(&harness_url);
+            let app_data_dir = app.try_state::<AppState>().map(|s| s.app_data_dir.clone());
+            let health = check_backend_health(&harness_url, app_data_dir.as_deref());
             if last != Some(health) {
                 last = Some(health);
                 if let Some(state) = app.try_state::<AppState>() {
