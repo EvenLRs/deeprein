@@ -1,8 +1,9 @@
-// 把官方 DeepSeek Harness 后端（@deepseek-ai/dsh + Node 运行时）打包到 backend/
+// 把精简 Node 运行时与随壳插件打包到 backend/（不再随应用打包 @deepseek-ai/dsh 主体）
 // CI 与本地均可运行：node scripts/bundle-backend.mjs
 // 产物结构：
 //   backend/node/node.exe          (Windows) / backend/node/bin/node (macOS)
-//   backend/dsh/node_modules/...   官方 dsh 包及其运行时依赖
+//   backend/plugin/*.tgz           随壳分发的插件 tarball
+//   backend/tools/node_modules/pnpm  运行时插件安装器
 import { spawnSync } from 'node:child_process';
 import {
   existsSync,
@@ -17,12 +18,10 @@ import {
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// 按目标平台裁剪内置后端（与 scripts/ensure-backend.mjs 内的同名逻辑保持同步）：
-//  1) node-pty 只保留当前平台的 prebuilds（他平台二进制各 28-30MB，运行时用不到）
-//  2) Node 发行目录的 include/ 头文件（仅 node-gyp 编译原生模块需要；本项目原生依赖均带平台 prebuild）
-//  3) npm 自带的文档目录
-// 注意：node-pty 的 src/deps/third_party 仅在没有 prebuild 时才需要，一并移除；保留 binding.gyp 以兼容 npm rebuild。
-function pruneBackendPlatform(dshDir, nodeDir, platform, arch) {
+// 按目标平台裁剪内置 Node 发行目录：
+//  1) include/ 头文件（仅 node-gyp 编译原生模块需要；本项目原生依赖均带平台 prebuild）
+//  2) npm 自带的文档目录
+function pruneNodeRuntime(nodeDir, platform, arch) {
   let removed = 0;
   const measure = (p) => {
     try {
@@ -48,39 +47,7 @@ function pruneBackendPlatform(dshDir, nodeDir, platform, arch) {
     return n;
   };
 
-  // 1) node-pty 其他平台 prebuilds
-  const ptyPre = join(dshDir, 'node_modules', 'node-pty', 'prebuilds');
-  if (existsSync(ptyPre)) {
-    const want = `${platform}-${arch}`;
-    for (const d of readdirSync(ptyPre)) {
-      if (d !== want) prune(join(ptyPre, d));
-    }
-  }
-  // node-pty 编译源码（prebuilds 存在时不会走 gyp 编译）
-  prune(join(dshDir, 'node_modules', 'node-pty', 'src'));
-  prune(join(dshDir, 'node_modules', 'node-pty', 'deps'));
-  prune(join(dshDir, 'node_modules', 'node-pty', 'third_party'));
-
-  // 2) 大体积 sourcemap（生产运行时不需要）
-  if (existsSync(dshDir)) {
-    const stack = [dshDir];
-    while (stack.length) {
-      const dir = stack.pop();
-      let entries;
-      try {
-        entries = readdirSync(dir, { withFileTypes: true });
-      } catch {
-        continue;
-      }
-      for (const e of entries) {
-        const f = join(dir, e.name);
-        if (e.isDirectory()) stack.push(f);
-        else if (e.name.endsWith('.map')) prune(f);
-      }
-    }
-  }
-
-  // 3) Node 发行目录:include 头文件 + npm 文档(macOS: lib/...;Windows: 根下 node_modules/...)
+  // Node 发行目录:include 头文件 + npm 文档(macOS: lib/...;Windows: 根下 node_modules/...)
   if (nodeDir) {
     prune(join(nodeDir, 'include'));
     prune(join(nodeDir, 'lib', 'node_modules', 'npm', 'docs'));
@@ -91,50 +58,9 @@ function pruneBackendPlatform(dshDir, nodeDir, platform, arch) {
   console.log(`[裁剪] 目标平台 ${platform}-${arch}，移除 ${mb} MB 冗余文件`);
 }
 
-// 官方 @deepseek-ai/dsh 版本解析（不再写死）：
-//   1) 命令行 --version=x.y.z 显式指定（可复现构建）
-//   2) 环境变量 DSH_VERSION
-//   3) 联网获取 npm registry 的最新版本（默认行为，构建时跟随最新版）
-//   4) 网络失败时回退到 FALLBACK_DSH_VERSION
-//   1) 命令行 --version=x.y.z 显式指定（可复现构建）
-//   2) 环境变量 DSH_VERSION
-//   3) 联网获取 npm registry 的最新版本（默认行为，构建时跟随最新版）
-//   4) 网络失败时回退到 FALLBACK_DSH_VERSION
-const FALLBACK_DSH_VERSION = '0.1.0-rc.6';
 const NODE_VERSION = 'v24.18.0';
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const backend = join(root, 'backend');
-
-function resolveDshVersion(argv) {
-  const cliArg = argv.find((a) => a.startsWith('--version='));
-  if (cliArg) {
-    const v = cliArg.split('=')[1].trim();
-    if (v) {
-      console.log(`[版本] 使用命令行指定版本 ${v}`);
-      return v;
-    }
-  }
-  if (process.env.DSH_VERSION) {
-    console.log(`[版本] 使用环境变量 DSH_VERSION=${process.env.DSH_VERSION}`);
-    return process.env.DSH_VERSION.trim();
-  }
-  return null;
-}
-
-async function latestDshVersion() {
-  try {
-    const res = await fetch('https://registry.npmjs.org/@deepseek-ai/dsh/latest', {
-      redirect: 'follow',
-    });
-    if (!res.ok) throw new Error(`registry HTTP ${res.status}`);
-    const json = await res.json();
-    if (!json || typeof json.version !== 'string') throw new Error('registry 响应缺少 version');
-    return json.version;
-  } catch (e) {
-    console.warn(`[警告] 获取 npm 最新版本失败（${e.message}），回退到 ${FALLBACK_DSH_VERSION}`);
-    return FALLBACK_DSH_VERSION;
-  }
-}
 
 const platform = process.platform; // win32 | darwin
 const arch = process.arch; // x64 | arm64
@@ -171,16 +97,6 @@ function runNpm(args, opts = {}) {
   }
 }
 
-// npm 11+ 才有 allowScripts 机制（默认跳过未批准脚本，需 approve + rebuild）；npm 10 直接执行
-function npmMajor() {
-  const cli = npmCli();
-  const r = cli
-    ? spawnSync(process.execPath, [cli, '--version'], { encoding: 'utf8' })
-    : spawnSync('npm', ['--version'], { encoding: 'utf8' });
-  const m = parseInt((r.stdout || '').trim().split('.')[0], 10);
-  return Number.isFinite(m) ? m : 0;
-}
-
 async function download(url, out) {
   if (existsSync(out)) {
     console.log('[skip] 已存在', out);
@@ -195,6 +111,14 @@ async function download(url, out) {
 }
 
 mkdirSync(backend, { recursive: true });
+
+// 上一轮脚本会把 @deepseek-ai/dsh 装进 backend/dsh；现在不再打包该主体。
+// 开发机/CI 缓存上可能残留旧目录，主动清掉，避免误当内置后端或占体积。
+const leftoverDshDir = join(backend, 'dsh');
+if (existsSync(leftoverDshDir)) {
+  console.log('[清理] 移除旧的 backend/dsh 残留');
+  rmSync(leftoverDshDir, { recursive: true, force: true });
+}
 
 // ---- 1. Node 运行时 ----
 const nodeDir = join(backend, 'node');
@@ -231,68 +155,10 @@ if (platform === 'win32') {
   throw new Error(`不支持的目标平台: ${platform}/${arch}`);
 }
 
-// ---- 2. 官方 dsh 包 ----
-const dshVersion = resolveDshVersion(process.argv.slice(2)) ?? (await latestDshVersion());
-console.log(`[版本] 使用 @deepseek-ai/dsh@${dshVersion}`);
-const dshDir = join(backend, 'dsh');
-mkdirSync(dshDir, { recursive: true });
-const dshBin = join(dshDir, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
-if (!existsSync(dshBin)) {
-  console.log(`[npm] 安装 @deepseek-ai/dsh@${dshVersion} ...`);
-  runNpm([
-    'install',
-    '--prefix',
-    dshDir,
-    `@deepseek-ai/dsh@${dshVersion}`,
-    '--ignore-scripts',
-    '--omit=dev',
-    '--no-audit',
-    '--no-fund',
-    '--no-package-lock',
-  ]);
+// 按目标平台裁剪 Node 发行目录冗余内容（头文件、文档）
+pruneNodeRuntime(nodeDir, platform, arch);
 
-  const allowedScripts = [
-    '@deepseek-ai/dsh-subprocess-local',
-    '@google/genai',
-    'koffi',
-    'node-pty',
-    'protobufjs',
-  ];
-
-  for (const pkgName of allowedScripts) {
-    try {
-      runNpm(['rebuild', pkgName], { cwd: dshDir });
-    } catch (err) {
-      console.warn(`[提示] 原生模块 ${pkgName} 定向构建未触发: ${err.message || err}`);
-    }
-  }
-
-  const pkgJsonPath = join(dshDir, 'package.json');
-  if (!existsSync(pkgJsonPath)) {
-    throw new Error(`无法找到后端根目录 package.json (${pkgJsonPath})，无法写入 allowScripts 策略`);
-  }
-  const pkgJson = JSON.parse(readFileSync(pkgJsonPath, 'utf8'));
-  const newAllowScripts = {};
-  for (const name of allowedScripts) {
-    const pkgFile = join(dshDir, 'node_modules', ...name.split('/'), 'package.json');
-    if (!existsSync(pkgFile)) {
-      throw new Error(`无法找到已安装包 ${name} 的 package.json (${pkgFile})`);
-    }
-    const pkgData = JSON.parse(readFileSync(pkgFile, 'utf8'));
-    const ver = pkgData.version;
-    if (!ver || typeof ver !== 'string') {
-      throw new Error(`已安装包 ${name} 缺少有效的 version 字段`);
-    }
-    newAllowScripts[`${name}@${ver}`] = true;
-  }
-  pkgJson.allowScripts = newAllowScripts;
-  writeFileSync(pkgJsonPath, JSON.stringify(pkgJson, null, 2) + '\n');
-}
-
-// 按目标平台裁剪冗余内容（他平台 prebuilds、头文件、sourcemap、文档）
-pruneBackendPlatform(dshDir, nodeDir, platform, arch);
-
-// ---- 3. 第三方 Harness 插件（随壳打包；运行时由 ensure-plugin.mjs 装入 web profile） ----
+// ---- 2. 第三方 Harness 插件（随壳打包；运行时由 ensure-plugin.mjs 装入 web profile） ----
 const pluginDir = join(backend, 'plugin');
 mkdirSync(pluginDir, { recursive: true });
 const pluginManifest = [];
@@ -352,7 +218,7 @@ for (const p of bundledPlugins) {
   pluginManifest.push({ name: p.name, version, tarball });
 }
 
-// ---- 4. pnpm 运行时（安装插件用；随壳分发，不依赖目标机 PATH） ----
+// ---- 3. pnpm 运行时（安装插件用；随壳分发，不依赖目标机 PATH） ----
 const pnpmCli = join(backend, 'tools', 'node_modules', 'pnpm', 'bin', 'pnpm.cjs');
 if (!existsSync(pnpmCli)) {
   console.log('[工具] 安装 pnpm（运行时插件安装器）');
@@ -368,7 +234,7 @@ if (!existsSync(pnpmCli)) {
   ]);
 }
 
-// ---- 5. 元信息 ----
+// ---- 4. 元信息 ----
 writeFileSync(
   join(pluginDir, 'manifest.json'),
   JSON.stringify(
@@ -384,7 +250,7 @@ writeFileSync(
 writeFileSync(
   join(backend, 'bundle-info.json'),
   JSON.stringify(
-    { dsh: dshVersion, node: NODE_VERSION, platform, arch, plugins: pluginManifest },
+    { node: NODE_VERSION, platform, arch, plugins: pluginManifest },
     null,
     2,
   ),
@@ -392,5 +258,4 @@ writeFileSync(
 
 console.log('[OK] 后端已打包');
 console.log('  node:', nodeExe);
-console.log('  dsh :', dshBin);
 console.log('  插件:', join(pluginDir, 'manifest.json'));

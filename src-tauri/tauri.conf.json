@@ -20,7 +20,6 @@
     "createUpdaterArtifacts": true,
     "resources": [
       "../backend/node",
-      "../backend/dsh/node_modules",
       "../backend/plugin",
       "../backend/tools/node_modules/pnpm"
     ],
