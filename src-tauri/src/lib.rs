@@ -83,11 +83,7 @@ struct ClientConfig {
     start_check_interval_ms: u64,
     /// 后端日志文件名（相对 exe 目录）
     backend_log_file: String,
-    /// 每次启动时联网检查 DeepSeek Harness 更新
-    check_updates: bool,
-    /// 发现新版本时自动下载安装（同步更新）
-    auto_update: bool,
-    /// 安装/更新后端的超时（秒；首次安装需下载全部依赖，可适当放宽）
+    /// 首次安装后端的超时（秒；首次安装需下载全部依赖，可适当放宽）
     update_timeout_sec: u64,
     /// npm registry 上 dsh 包的地址（版本查询用）
     registry_url: String,
@@ -111,8 +107,6 @@ impl Default for ClientConfig {
             start_timeout_sec: 90,
             start_check_interval_ms: 1500,
             backend_log_file: "backend.log".into(),
-            check_updates: true,
-            auto_update: true,
             update_timeout_sec: 600,
             registry_url: DEFAULT_REGISTRY_URL.to_string(),
             check_app_updates: true,
@@ -211,20 +205,7 @@ struct BackendStartResult {
     command: String,
 }
 
-/// 当前后端版本与更新开关信息（启动页展示用）
-#[derive(Serialize)]
-struct UpdateInfo {
-    check_updates: bool,
-    auto_update: bool,
-    update_timeout_sec: u64,
-    registry_url: String,
-    /// 当前可用后端的版本（应用管理目录 → 内置 → 本机安装）
-    current_version: Option<String>,
-    /// 版本来源：managed | bundled | local | none
-    current_source: String,
-}
-
-/// 更新检查/安装结果（与 ensure-backend.mjs 的 RESULT 行同构）
+/// 首次安装结果（与 ensure-backend.mjs 的 RESULT 行同构）
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 struct UpdateCheck {
@@ -321,29 +302,27 @@ fn find_node() -> Option<String> {
     Some("node".to_string())
 }
 
-/// 在 npx 缓存与 npm 全局目录里找 @deepseek-ai/dsh 的 CLI 入口（本机已安装的 Harness）
-fn find_dsh_bin() -> Option<String> {
-    let mut roots: Vec<PathBuf> = Vec::new();
-    #[cfg(windows)]
-    {
-        if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            roots.push(PathBuf::from(local).join("npm-cache").join("_npx"));
-        }
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            // npm install -g 的全局安装目录
-            roots.push(PathBuf::from(appdata).join("npm").join("node_modules"));
-        }
+/// 若 cand 存在，按 mtime 保留较新的那份 CLI 入口
+fn consider_dsh_bin(best: &mut Option<(SystemTime, PathBuf)>, cand: PathBuf) {
+    if !cand.exists() {
+        return;
     }
-    #[cfg(not(windows))]
-    {
-        if let Ok(home) = std::env::var("HOME") {
-            roots.push(PathBuf::from(home).join(".npm").join("_npx"));
-        }
-        roots.push(PathBuf::from("/usr/local/lib/node_modules"));
+    let mtime = fs::metadata(&cand)
+        .and_then(|m| m.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let newer = best.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true);
+    if newer {
+        *best = Some((mtime, cand));
     }
+}
+
+/// 扫描 npx 缓存与 npm 全局 node_modules，返回较新的 dsh CLI 入口。
+/// npx 缓存：root/<hash>/node_modules/@deepseek-ai/dsh/lib/bin.js
+/// 全局安装：root/@deepseek-ai/dsh/lib/bin.js（包直接落在 node_modules 根下）
+fn scan_dsh_bin(npx_roots: &[PathBuf], global_roots: &[PathBuf]) -> Option<PathBuf> {
     let mut best: Option<(SystemTime, PathBuf)> = None;
-    for root in roots {
-        if let Ok(entries) = fs::read_dir(&root) {
+    for root in npx_roots {
+        if let Ok(entries) = fs::read_dir(root) {
             for entry in entries.flatten() {
                 let cand = entry
                     .path()
@@ -352,19 +331,68 @@ fn find_dsh_bin() -> Option<String> {
                     .join("dsh")
                     .join("lib")
                     .join("bin.js");
-                if cand.exists() {
-                    let mtime = fs::metadata(&cand)
-                        .and_then(|m| m.modified())
-                        .unwrap_or(SystemTime::UNIX_EPOCH);
-                    let newer = best.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true);
-                    if newer {
-                        best = Some((mtime, cand));
-                    }
-                }
+                consider_dsh_bin(&mut best, cand);
             }
         }
     }
-    best.map(|(_, p)| p.to_string_lossy().into_owned())
+    for root in global_roots {
+        let cand = root
+            .join("@deepseek-ai")
+            .join("dsh")
+            .join("lib")
+            .join("bin.js");
+        consider_dsh_bin(&mut best, cand);
+    }
+    best.map(|(_, p)| p)
+}
+
+/// 在 npx 缓存与 npm 全局目录里找 @deepseek-ai/dsh 的 CLI 入口（本机已安装的 Harness）
+fn find_dsh_bin() -> Option<String> {
+    let mut npx_roots: Vec<PathBuf> = Vec::new();
+    let mut global_roots: Vec<PathBuf> = Vec::new();
+    #[cfg(windows)]
+    {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            npx_roots.push(PathBuf::from(local).join("npm-cache").join("_npx"));
+        }
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            // npm install -g 的全局安装目录：%APPDATA%\npm\node_modules\@deepseek-ai\dsh\...
+            global_roots.push(PathBuf::from(appdata).join("npm").join("node_modules"));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            npx_roots.push(PathBuf::from(home).join(".npm").join("_npx"));
+        }
+        // npm install -g 的全局安装目录：/usr/local/lib/node_modules/@deepseek-ai/dsh/...
+        global_roots.push(PathBuf::from("/usr/local/lib/node_modules"));
+    }
+    scan_dsh_bin(&npx_roots, &global_roots).map(|p| p.to_string_lossy().into_owned())
+}
+
+/// PATH 上的 `dsh` 可执行文件（npm -g / 用户手动安装）。存在即视为本机已装。
+fn find_dsh_in_path() -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        #[cfg(windows)]
+        {
+            for name in ["dsh.cmd", "dsh.exe", "dsh.bat", "dsh"] {
+                let cand = dir.join(name);
+                if cand.is_file() {
+                    return Some(normalize_path(&cand.to_string_lossy()));
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let cand = dir.join("dsh");
+            if cand.is_file() {
+                return Some(cand.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
 }
 
 /// Windows 的 resource_dir 会带 `\\?\` 长路径前缀，node 等子进程无法解析，需剥掉
@@ -418,25 +446,7 @@ fn push_port(cmd: &mut Vec<String>, harness_url: &str) {
     }
 }
 
-/// 随应用打包的官方 Harness 后端（backend/node + backend/dsh）
-fn bundled_backend(resource_dir: &Path, harness_url: &str) -> Option<Vec<String>> {
-    for root in bundled_roots(resource_dir) {
-        let node = root.join(bundled_node_rel());
-        let bin = root.join(dsh_bin_rel());
-        if node.exists() && bin.exists() {
-            let mut cmd = vec![
-                normalize_path(&node.to_string_lossy()),
-                normalize_path(&bin.to_string_lossy()),
-                "web".into(),
-            ];
-            push_port(&mut cmd, harness_url);
-            return Some(cmd);
-        }
-    }
-    None
-}
-
-/// 应用管理的后端（自动更新安装到 app_data_dir/backend，可写）
+/// 应用管理的后端（首次安装到 app_data_dir/backend，可写；已装则原样使用，不主动升级）
 fn managed_backend(
     app_data_dir: &Path,
     resource_dir: &Path,
@@ -454,20 +464,6 @@ fn managed_backend(
     ];
     push_port(&mut cmd, harness_url);
     Some(cmd)
-}
-
-/// 读取 package.json 的 version 字段
-fn read_pkg_version(pkg_path: &Path) -> Option<String> {
-    let text = fs::read_to_string(pkg_path).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    v.get("version").and_then(|x| x.as_str()).map(String::from)
-}
-
-/// 读取 bundle-info.json 的 dsh 版本字段（打包脚本与更新脚本都会写入）
-fn read_bundle_info_version(info_path: &Path) -> Option<String> {
-    let text = fs::read_to_string(info_path).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    v.get("dsh").and_then(|x| x.as_str()).map(String::from)
 }
 
 /// 定位可运行 ensure-backend.mjs 的 Node：内置（自带 npm，优先）→ 本机 PATH/标准目录
@@ -504,42 +500,7 @@ fn bundled_plugin_manifest(resource_dir: &Path) -> Option<PathBuf> {
     None
 }
 
-/// 当前可用的后端版本与来源：应用管理目录 → 内置 → 本机安装 → 无
-fn current_backend_version(
-    app_data_dir: &Path,
-    resource_dir: &Path,
-) -> (Option<String>, &'static str) {
-    let managed_pkg = app_data_dir
-        .join("backend")
-        .join("dsh")
-        .join("node_modules")
-        .join("@deepseek-ai")
-        .join("dsh")
-        .join("package.json");
-    if let Some(v) = read_pkg_version(&managed_pkg) {
-        return (Some(v), "managed");
-    }
-    for root in bundled_roots(resource_dir) {
-        if let Some(v) = read_bundle_info_version(&root.join("bundle-info.json")) {
-            return (Some(v), "bundled");
-        }
-    }
-    if let Some(bin) = find_dsh_bin() {
-        // .../node_modules/@deepseek-ai/dsh/lib/bin.js → package.json 在 dsh/ 目录下
-        let pkg = Path::new(&bin)
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|d| d.join("package.json"));
-        if let Some(p) = pkg {
-            if let Some(v) = read_pkg_version(&p) {
-                return (Some(v), "local");
-            }
-        }
-    }
-    (None, "none")
-}
-
-/// 运行 ensure-backend.mjs（内嵌脚本），check_only=true 仅查版本，否则安装/更新。
+/// 运行 ensure-backend.mjs（内嵌脚本），check_only=true 仅查版本，否则安装（已装则脚本自行跳过升级由调用方保证）。
 /// 输出写入 app_data_dir/backend/update.log；解析最后的 RESULT 行返回。
 fn run_update_script(
     cfg: &ClientConfig,
@@ -766,7 +727,7 @@ fn run_plugin_script(
 }
 
 /// 解析最终的后端启动命令：
-/// 配置覆盖 → 应用管理（自动更新目录，优先）→ 本机已安装 → 内置 → PATH/npx 兜底
+/// 配置覆盖 → 应用管理目录（已装则直接用，不升级）→ PATH 上的 dsh → npx 缓存/全局 node_modules → 空（调用方再走首次安装）
 fn resolve_backend_command(
     cfg: &ClientConfig,
     resource_dir: &Path,
@@ -777,34 +738,26 @@ fn resolve_backend_command(
             return cmd.clone();
         }
     }
-    // 1) 应用管理的后端（首次启动/自动更新生成，跟随最新版本）
+    // 1) 应用管理目录里已有 dsh（先前首次安装留下的），原样启动，禁止主动升级
     if let Some(cmd) = managed_backend(app_data_dir, resource_dir, &cfg.harness_url) {
         return cmd;
     }
-    // 2) 本机已安装的 Harness（优先使用本地安装）
-    if let Some(node) = find_node() {
-        if let Some(bin) = find_dsh_bin() {
-            return vec![node, bin, "web".into()];
-        }
-    }
-    // 3) 内置（随应用打包）的官方 Harness
-    if let Some(cmd) = bundled_backend(resource_dir, &cfg.harness_url) {
+    // 2) PATH 上的 dsh（npm -g / 用户手动安装）
+    if let Some(dsh) = find_dsh_in_path() {
+        let mut cmd = vec![dsh, "web".into()];
+        push_port(&mut cmd, &cfg.harness_url);
         return cmd;
     }
-    // 4) 兜底：PATH 上的 dsh，或 npx 现场拉取
-    #[cfg(windows)]
-    let fallback = vec![
-        "cmd".into(),
-        "/C".into(),
-        "dsh web || npx -y @deepseek-ai/dsh web".into(),
-    ];
-    #[cfg(not(windows))]
-    let fallback = vec![
-        "sh".into(),
-        "-c".into(),
-        "dsh web || npx -y @deepseek-ai/dsh web".into(),
-    ];
-    fallback
+    // 3) npx 缓存或 npm 全局 node_modules 里的 CLI 入口
+    if let Some(node) = find_node() {
+        if let Some(bin) = find_dsh_bin() {
+            let mut cmd = vec![node, bin, "web".into()];
+            push_port(&mut cmd, &cfg.harness_url);
+            return cmd;
+        }
+    }
+    // 4) 本机未装：返回空命令，由启动流程走首次安装（ensure-backend.mjs）
+    Vec::new()
 }
 
 /// 后端地址是否可达（TCP 连接探测，2 秒超时）。
@@ -965,18 +918,23 @@ fn get_config(state: State<'_, AppState>) -> ConfigView {
     }
 }
 
-/// 启动 Harness 后端：分离进程、无窗口，stdout/stderr 写入 exe 旁 backend.log
+/// 启动 Harness 后端：分离进程、无窗口，stdout/stderr 写入 exe 旁 backend.log。
+/// 本机未装 dsh 时会在阻塞线程池里走首次安装（可能数分钟），避免卡住 UI。
 #[tauri::command]
-fn start_backend(state: State<'_, AppState>) -> Result<BackendStartResult, String> {
+async fn start_backend(state: State<'_, AppState>) -> Result<BackendStartResult, String> {
     let cfg = lock_or_recover(&state.config).clone();
     let resource_dir = state.resource_dir.clone();
     let app_data_dir = state.app_data_dir.clone();
-    let result = spawn_backend_impl(&cfg, &resource_dir, &app_data_dir)?;
-    // 记录进程组组长 pid，供后端状态监测重启时先杀旧进程
-    if let Some(pid) = result.pid {
-        *lock_or_recover(&state.backend_pid) = Some(pid);
-    }
-    Ok(result)
+    let backend_pid = state.backend_pid.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = spawn_backend_impl(&cfg, &resource_dir, &app_data_dir)?;
+        if let Some(pid) = result.pid {
+            *lock_or_recover(&backend_pid) = Some(pid);
+        }
+        Ok(result)
+    })
+    .await
+    .map_err(|e| format!("启动后端失败: {e}"))?
 }
 
 /// 重启 Harness 后端：杀掉当前监听端口的后端（本客户端启动的实例），
@@ -1038,9 +996,20 @@ fn spawn_backend_impl(
     resource_dir: &Path,
     app_data_dir: &Path,
 ) -> Result<BackendStartResult, String> {
-    let cmdline = resolve_backend_command(cfg, resource_dir, app_data_dir);
+    let mut cmdline = resolve_backend_command(cfg, resource_dir, app_data_dir);
     if cmdline.is_empty() {
-        return Err("未配置后端启动命令".into());
+        // 本机未装 dsh：仅在首次缺失时安装，已装绝不主动升级
+        rust_log("spawn_backend_impl: 本机未检测到 dsh，开始首次安装");
+        let installed = run_update_script(cfg, resource_dir, app_data_dir, false)?;
+        if !installed.ok {
+            return Err(installed.error.unwrap_or_else(|| {
+                "首次安装 DeepSeek Harness 失败，详见 update.log".into()
+            }));
+        }
+        cmdline = resolve_backend_command(cfg, resource_dir, app_data_dir);
+        if cmdline.is_empty() {
+            return Err("首次安装完成，但仍未找到可用的 dsh 启动入口".into());
+        }
     }
     let log_path = exe_dir().join(&cfg.backend_log_file);
     // 重启场景：旧后端进程刚被 taskkill，其 stdout/stderr 句柄可能仍短暂占用 backend.log，
@@ -1304,50 +1273,6 @@ fn read_log_tail(log_path: &Path, lines: Option<usize>) -> String {
         }
         Err(_) => "(日志尚未生成)".to_string(),
     }
-}
-
-/// 当前后端版本与更新开关（启动页先调用，用于展示与决定是否检查更新）
-#[tauri::command]
-fn get_update_info(state: State<'_, AppState>) -> UpdateInfo {
-    let cfg = lock_or_recover(&state.config);
-    let (current_version, current_source) =
-        current_backend_version(&state.app_data_dir, &state.resource_dir);
-    UpdateInfo {
-        check_updates: cfg.check_updates,
-        auto_update: cfg.auto_update,
-        update_timeout_sec: cfg.update_timeout_sec,
-        registry_url: cfg.registry_url.clone(),
-        current_version,
-        current_source: current_source.to_string(),
-    }
-}
-
-/// 联网检查 DeepSeek Harness 是否有新版本（运行 ensure-backend.mjs --check-only）。
-/// 放到阻塞线程池执行，避免阻塞主线程（同步命令会卡 UI）。
-#[tauri::command]
-async fn check_update(state: State<'_, AppState>) -> Result<UpdateCheck, String> {
-    let cfg = lock_or_recover(&state.config).clone();
-    let resource_dir = state.resource_dir.clone();
-    let app_data_dir = state.app_data_dir.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        run_update_script(&cfg, &resource_dir, &app_data_dir, true)
-    })
-    .await
-    .map_err(|e| format!("检查更新失败: {e}"))?
-}
-
-/// 安装/更新 DeepSeek Harness 后端到应用数据目录（首次安装或同步到最新版）。
-/// 可能耗时数分钟（下载依赖），同样放到阻塞线程池；进度见 update.log（read_update_log 轮询）。
-#[tauri::command]
-async fn install_update(state: State<'_, AppState>) -> Result<UpdateCheck, String> {
-    let cfg = lock_or_recover(&state.config).clone();
-    let resource_dir = state.resource_dir.clone();
-    let app_data_dir = state.app_data_dir.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        run_update_script(&cfg, &resource_dir, &app_data_dir, false)
-    })
-    .await
-    .map_err(|e| format!("安装/更新失败: {e}"))?
 }
 
 /// 把随壳打包的 Harness 插件安装进 dsh web profile（阻塞线程池执行，可能耗时数分钟）
@@ -1800,9 +1725,6 @@ pub fn run() {
             open_harness,
             focus_window,
             quit_app,
-            get_update_info,
-            check_update,
-            install_update,
             read_update_log,
             check_app_update,
             install_app_update,
@@ -1812,4 +1734,99 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .run(tauri::generate_context!())
         .expect("Tauri 应用启动失败");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn write_fake_bin(path: &PathBuf) {
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(path, "// fake dsh bin\n").unwrap();
+    }
+
+    #[test]
+    fn scan_dsh_bin_finds_global_layout() {
+        let tmp = std::env::temp_dir().join(format!(
+            "deeprein-dsh-scan-global-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global_root = tmp.join("node_modules");
+        let bin = global_root
+            .join("@deepseek-ai")
+            .join("dsh")
+            .join("lib")
+            .join("bin.js");
+        write_fake_bin(&bin);
+
+        let found = scan_dsh_bin(&[], &[global_root.clone()]).expect("应找到全局安装的 bin.js");
+        assert_eq!(found, bin);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn scan_dsh_bin_finds_npx_cache_layout() {
+        let tmp = std::env::temp_dir().join(format!(
+            "deeprein-dsh-scan-npx-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let npx_root = tmp.join("_npx");
+        let bin = npx_root
+            .join("abc123hash")
+            .join("node_modules")
+            .join("@deepseek-ai")
+            .join("dsh")
+            .join("lib")
+            .join("bin.js");
+        write_fake_bin(&bin);
+
+        let found = scan_dsh_bin(&[npx_root.clone()], &[]).expect("应找到 npx 缓存里的 bin.js");
+        assert_eq!(found, bin);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn scan_dsh_bin_global_not_confused_with_npx_layout() {
+        let tmp = std::env::temp_dir().join(format!(
+            "deeprein-dsh-scan-mix-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global_root = tmp.join("node_modules");
+        // 故意放一个 npx 形态的错误路径，确认全局扫描不会去拼 <entry>/node_modules/...
+        let wrong = global_root
+            .join("@deepseek-ai")
+            .join("node_modules")
+            .join("@deepseek-ai")
+            .join("dsh")
+            .join("lib")
+            .join("bin.js");
+        write_fake_bin(&wrong);
+        let right = global_root
+            .join("@deepseek-ai")
+            .join("dsh")
+            .join("lib")
+            .join("bin.js");
+        write_fake_bin(&right);
+
+        let found = scan_dsh_bin(&[], &[global_root.clone()]).expect("应命中全局直铺路径");
+        assert_eq!(found, right);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
 }

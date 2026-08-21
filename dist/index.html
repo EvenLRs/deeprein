@@ -141,8 +141,6 @@
       start_timeout_sec: 90,
       start_check_interval_ms: 1500,
       backend_command: null,
-      check_updates: true,
-      auto_update: true,
       update_timeout_sec: 600,
       check_app_updates: true,
     };
@@ -157,7 +155,6 @@
     let startingBackend = false;
     let startDeadline = 0;
     let mainStarted = false;
-    let pendingUpdateChoice = false;
     let pendingAppUpdateChoice = false;
 
     function setStatus(text, ok, cmdText) {
@@ -224,6 +221,16 @@
     async function doStart() {
       if (startingBackend) return; // 防止重叠轮询重复启动
       startingBackend = true;
+      // 首次安装会写 update.log；已装则直接 spawn，轮询拿不到新内容也无妨
+      const poll = setInterval(async () => {
+        try {
+          const tail = await tauri().invoke('read_update_log', { lines: 1 });
+          if (tail && tail !== '(日志尚未生成)') {
+            $('status-cmd').textContent = tail.trim().split('\n').pop();
+            $('status-cmd').classList.remove('hidden');
+          }
+        } catch { /* 忽略 */ }
+      }, 900);
       try {
         const r = await tauri().invoke('start_backend');
         await log('doStart(): start_backend OK: ' + JSON.stringify(r));
@@ -234,7 +241,9 @@
         await log('doStart(): start_backend 失败 ' + (e && e.message ? e.message : e));
         startingBackend = false; // 允许重试
         startedBackend = false;
-        fail('启动后端失败：' + (e && e.message ? e.message : e), '请检查 config.json 的 backendCommand 配置，或确认内置后端（backend/ 目录）完整。');
+        fail('启动后端失败：' + (e && e.message ? e.message : e), '请检查本机是否已安装 dsh，或查看下方日志 / update.log。');
+      } finally {
+        clearInterval(poll);
       }
     }
 
@@ -257,7 +266,7 @@
       if (!startedBackend) {
         if (cfg.auto_start_backend) {
           await log('tick(): ' + HARNESS + ' 不可达，触发自动启动');
-          setStatus('未检测到后端，正在自动启动…');
+          setStatus('未检测到运行中的后端，正在查找本机 dsh / 必要时首次安装…');
           await doStart();
         } else {
           await log('tick(): ' + HARNESS + ' 不可达且 auto_start=false');
@@ -287,88 +296,9 @@
       } catch { return null; }
     }
 
-    // ---------- DeepSeek Harness 更新检查 / 自动同步 ----------
-
-    async function doInstall() {
-      // 轮询 update.log 尾部展示安装进度
-      const poll = setInterval(async () => {
-        try {
-          const tail = await tauri().invoke('read_update_log', { lines: 1 });
-          if (tail && tail !== '(日志尚未生成)') {
-            $('status-cmd').textContent = tail.trim().split('\n').pop();
-            $('status-cmd').classList.remove('hidden');
-          }
-        } catch { /* 忽略 */ }
-      }, 900);
-      try {
-        const r = await tauri().invoke('install_update');
-        await log('doInstall(): install_update 返回 ' + JSON.stringify(r));
-        if (r && r.ok && r.updated) {
-          setStatus('DeepSeek Harness 已更新至 v' + r.latest + '，准备启动…', true);
-        } else if (r && r.ok) {
-          setStatus('DeepSeek Harness 已是最新版本', true);
-        } else {
-          await log('doInstall(): 更新未完成 ' + (r && r.error ? r.error : ''));
-          setStatus('更新未完成，继续启动…', false, '详见 update.log');
-        }
-      } catch (e) {
-        await log('doInstall(): 更新失败 ' + (e && e.message ? e.message : e));
-        setStatus('更新失败，继续启动…', false, String(e && e.message ? e.message : e));
-      } finally {
-        clearInterval(poll);
-      }
-    }
-
-    // 每次启动先检查更新：有新版则提醒并（按配置）自动同步安装
-    async function runUpdateFlow() {
-      try {
-        const info = await tauri().invoke('get_update_info');
-        await log('update: get_update_info ' + JSON.stringify(info));
-        cfg.check_updates = !!info.check_updates;
-        cfg.auto_update = !!info.auto_update;
-        if (!cfg.check_updates) return; // 配置关闭更新检查
-
-        setStatus('正在检查 DeepSeek Harness 更新…', false, info.current_version ? '当前版本 v' + info.current_version : '');
-
-        const res = await tauri().invoke('check_update');
-        await log('update: check_update ' + JSON.stringify(res));
-        if (!res || !res.ok) {
-          await log('update: 检查未完成（可能离线或缺少 Node）：' + (res && res.error ? res.error : ''));
-          return; // 离线等异常不阻塞启动
-        }
-        if (!res.update_available) {
-          const v = res.current || res.latest;
-          setStatus('DeepSeek Harness 已是最新版本' + (v ? ' (v' + v + ')' : ''), true);
-          return;
-        }
-
-        // 有新版本：提醒用户
-        if (res.current) {
-          setStatus('发现 DeepSeek Harness 新版本 v' + res.latest + '（当前 v' + res.current + '）', true);
-        } else {
-          setStatus('首次启动：正在准备获取最新 DeepSeek Harness v' + res.latest, true);
-        }
-
-        if (!cfg.auto_update) {
-          // 不自动更新：提供「立即更新 / 跳过」选择
-          await log('update: auto_update=false，等待用户选择');
-          pendingUpdateChoice = true;
-          $('update').classList.remove('hidden');
-          $('update-skip').classList.remove('hidden');
-          return;
-        }
-        await log('update: 自动同步更新 ' + res.current + ' → ' + res.latest);
-        setStatus('发现新版本 v' + res.latest + '，正在自动同步更新…', false, res.current ? res.current + ' → ' + res.latest : '');
-        await doInstall();
-      } catch (e) {
-        await log('update: 流程异常 ' + (e && e.message ? e.message : e));
-      }
-    }
-
     function startMain() {
       if (mainStarted || opened) return;
       mainStarted = true;
-      pendingUpdateChoice = false;
       $('update').classList.add('hidden');
       $('update-skip').classList.add('hidden');
       $('status-cmd').classList.add('hidden');
@@ -434,23 +364,13 @@
         if (pendingAppUpdateChoice) return; // 失败时保持选择状态
         return;
       }
-      setStatus('正在同步更新 DeepSeek Harness…', false, '首次更新需下载依赖，可能耗时数分钟');
-      await doInstall();
       startMain();
     };
     $('update-skip').onclick = () => {
       $('update').classList.add('hidden');
       $('update-skip').classList.add('hidden');
-      if (pendingAppUpdateChoice) {
-        pendingAppUpdateChoice = false;
-        setStatus('已跳过 DeepRein 更新，继续启动…');
-        // 继续后续流程（Harness 更新检查 → 主流程）
-        runUpdateFlow().then(() => {
-          if (!pendingUpdateChoice) startMain();
-        });
-        return;
-      }
-      setStatus('已跳过本次更新，正在启动…');
+      pendingAppUpdateChoice = false;
+      setStatus('已跳过 DeepRein 更新，继续启动…');
       startMain();
     };
     $('retry').onclick = () => {
@@ -492,12 +412,10 @@
       }
       HARNESS = cfg.harness_url;
       await log('init(): HARNESS=' + HARNESS + ' auto_start=' + cfg.auto_start_backend + ' interval=' + cfg.start_check_interval_ms);
-      // 启动顺序：壳更新检查 → Harness 后端更新检查 → 常规检测流程
+      // 启动顺序：壳更新检查 → 常规检测流程（不再检查 / 自动更新已安装的 dsh）
       if (tauri()) {
         await runAppUpdateFlow();
         if (pendingAppUpdateChoice) return; // 等待用户选择「立即更新 / 跳过更新」
-        await runUpdateFlow();
-        if (pendingUpdateChoice) return; // 等待用户选择「立即更新 / 跳过更新」
       }
       startMain();
     })();
