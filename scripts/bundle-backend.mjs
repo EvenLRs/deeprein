@@ -155,10 +155,19 @@ function npmCli() {
 
 function runNpm(args, opts = {}) {
   const cli = npmCli();
+  const mergedEnv = { ...process.env, ...(opts.env || {}) };
+  const nodeOptions = mergedEnv.NODE_OPTIONS || '';
+  const env = {
+    ...mergedEnv,
+    NODE_OPTIONS: nodeOptions.includes('--max-old-space-size')
+      ? nodeOptions
+      : `${nodeOptions} --max-old-space-size=4096`.trim(),
+  };
+  const execOpts = { ...opts, env };
   if (cli) {
-    sh(process.execPath, [cli, ...args], opts);
+    sh(process.execPath, [cli, ...args], execOpts);
   } else {
-    sh('npm', args, opts);
+    sh('npm', args, execOpts);
   }
 }
 
